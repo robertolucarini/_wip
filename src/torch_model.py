@@ -9,129 +9,74 @@ class TorchRoughSABR_FMM(nn.Module):
         self.dtype = torch.float64
         self.n_factors = n_factors
         
-        # Buffers for simulation constants
         self.register_buffer('T', torch.tensor(tenors, device=device, dtype=self.dtype))
         self.register_buffer('tau', torch.tensor(np.diff(tenors), device=device, dtype=self.dtype))
         self.N = len(F0)
         
-        # Parameters for AAD (Requires Grad)
         self.F0 = nn.Parameter(torch.tensor(F0, device=device, dtype=self.dtype))
         self.alphas = nn.Parameter(torch.tensor(alpha_f(tenors[:-1]), device=device, dtype=self.dtype))
         
-        # Static Parameters (Buffers)
         self.register_buffer('rhos', torch.tensor(rho_f(tenors[:-1]), device=device, dtype=self.dtype))
         self.register_buffer('nus', torch.tensor(nu_f(tenors[:-1]), device=device, dtype=self.dtype))
         self.register_buffer('H', torch.tensor(H, device=device, dtype=self.dtype))
 
-        # -----------------------------------------------------------------
-        # SPATIAL PCA FOR CURVE DECORRELATION
-        # -----------------------------------------------------------------
-        # 1. Parametric Spatial Correlation Matrix: rho_ij = exp(-beta * |T_i - T_j|)
-        T_mat_i = self.T[:-1].unsqueeze(1)
-        T_mat_j = self.T[:-1].unsqueeze(0)
+        # PCA Setup
+        T_mat_i, T_mat_j = self.T[:-1].unsqueeze(1), self.T[:-1].unsqueeze(0)
         spatial_corr = torch.exp(-beta * torch.abs(T_mat_i - T_mat_j))
-        
-        # 2. Eigenvalue Decomposition
-        eigenvalues, eigenvectors = torch.linalg.eigh(spatial_corr)
-        idx = torch.argsort(eigenvalues, descending=True)
-        eigenvalues, eigenvectors = eigenvalues[idx], eigenvectors[:, idx]
-        
-        # 3. Compute Factor Loadings (Keep top n_factors)
-        top_evals = torch.clamp(eigenvalues[:n_factors], min=0.0)
-        top_evecs = eigenvectors[:, :n_factors]
-        loadings = top_evecs * torch.sqrt(top_evals).unsqueeze(0)
-        
-        # Normalize rows to ensure total variance per tenor remains exactly 1.0
-        row_norms = torch.sqrt(torch.sum(loadings**2, dim=1, keepdim=True))
-        self.register_buffer('loadings', loadings / row_norms)
-        
-        # 4. Precompute Lambda matrix for FMM Drift (Covariance between tenors)
-        Lambda = self.loadings @ self.loadings.T
-        # We only need the strict upper triangle for the drift summation (j > i)
-        self.register_buffer('Lambda_upper', torch.triu(Lambda, diagonal=1))
+        evals, evecs = torch.linalg.eigh(spatial_corr)
+        idx = torch.argsort(evals, descending=True)
+        loadings = evecs[:, idx[:n_factors]] * torch.sqrt(torch.clamp(evals[idx[:n_factors]], min=0.0)).unsqueeze(0)
+        self.register_buffer('loadings', loadings / torch.sqrt(torch.sum(loadings**2, dim=1, keepdim=True)))
+        self.register_buffer('Lambda_upper', torch.triu(self.loadings @ self.loadings.T, diagonal=1))
 
     def get_terminal_bond(self):
-        """ Differentiable P(0, Tn) bond """
-        dfs = 1.0 / (1.0 + self.tau * self.F0)
-        return torch.prod(dfs)
+        return torch.prod(1.0 / (1.0 + self.tau * self.F0))
 
-    def simulate_forward_curve(self, n_paths, time_grid, seed=56, freeze_drift=True, use_checkpoint=True):
-        """ 
-        Multi-Factor Arbitrage-Free Forward Market Model Simulation with AAD Checkpointing.
-        """
+    def simulate_forward_curve(self, n_paths, time_grid, seed=56, freeze_drift=True, use_checkpoint=False):
         n_steps = len(time_grid) - 1
         dt = (time_grid[1] - time_grid[0]).to(self.dtype)
         
-        # 1. Generate QMC Sobol Shocks (OUTSIDE the checkpoint to guarantee deterministic backward pass)
-        dimension = n_steps * (self.n_factors + 1)
-        sobol = torch.quasirandom.SobolEngine(dimension=dimension, scramble=True, seed=seed)
-        u_shocks = sobol.draw(n_paths).to(self.device).to(self.dtype)
-        u_shocks = torch.clamp(u_shocks, min=1e-7, max=1.0 - 1e-7)
+        # 1. PRE-CALCULATE VOLTERRA KERNEL (Saves millions of calculations)
+        t, s = time_grid[1:].to(self.dtype), time_grid[:-1].to(self.dtype)
+        gamma_const = torch.exp(torch.lgamma(self.H + 0.5))
+        kernel = torch.pow(torch.clamp(t[:, None] - s[None, :], min=1e-12), self.H - 0.5)
+        kernel = torch.where(t[:, None] > s[None, :], kernel / gamma_const, 0.0)
+        var_comp = 0.5 * (self.nus[0]**2) * (t**(2*self.H)) / (2.0 * self.H * gamma_const**2)
 
-        # 2. Define the exact block of math to be Checkpointed
-        def _simulate(u, f0, alphas):
-            """ Internal function that takes parameters explicitly for Autograd tracking """
-            from torch.distributions import Normal
-            dist = Normal(torch.tensor(0.0, device=self.device, dtype=self.dtype), 
-                          torch.tensor(1.0, device=self.device, dtype=self.dtype))
-            z = dist.icdf(u).view(n_paths, n_steps, self.n_factors + 1)
-            
-            # Curve Drivers & Volatility Driver
-            dZ_curve = z[..., :self.n_factors] * torch.sqrt(dt)
-            dZ_vol_perp = z[..., self.n_factors] * torch.sqrt(dt)
-            dW_v = self.rhos[0] * dZ_curve[..., 0] + torch.sqrt(1.0 - self.rhos[0]**2) * dZ_vol_perp
-            
-            # Rough Volterra Kernel
-            t, s = time_grid[1:].to(self.dtype), time_grid[:-1].to(self.dtype)
-            dt_mat = torch.clamp(t[:, None] - s[None, :], min=1e-12)
-            
-            import math 
-            gamma_factor = math.gamma(self.H.item() + 0.5)
-            kernel = torch.where(t[:, None] - s[None, :] > 0, dt_mat**(self.H - 0.5) / gamma_factor, 
-                                 torch.tensor(0.0, device=self.device, dtype=self.dtype))
-            
-            fBm = torch.matmul(dW_v, kernel.T)
-            var_comp = 0.5 * (self.nus[0]**2) * (t**(2*self.H)) / (2.0 * self.H * (gamma_factor**2))
-            unit_vols = torch.exp(self.nus[0] * fBm - var_comp)
-            
-            V2_dt = (unit_vols ** 2) * dt  
-            
-            dW_r = torch.einsum('psk,nk->psn', dZ_curve, self.loadings)
-            dM = unit_vols.unsqueeze(2) * dW_r  
+        # 2. GENERATE SHOCKS
+        sobol = torch.quasirandom.SobolEngine(dimension=n_steps * (self.n_factors + 1), scramble=True, seed=seed)
+        u = sobol.draw(n_paths).to(self.device).to(self.dtype)
+        from torch.distributions import Normal
+        dist = Normal(torch.tensor(0.0, device=self.device), torch.tensor(1.0, device=self.device))
+        z = dist.icdf(torch.clamp(u, 1e-7, 1-1e-7)).view(n_paths, n_steps, self.n_factors + 1)
+        
+        dZ_c = z[..., :self.n_factors] * torch.sqrt(dt)
+        dW_v = self.rhos[0] * dZ_c[..., 0] + torch.sqrt(1.0 - self.rhos[0]**2) * z[..., self.n_factors] * torch.sqrt(dt)
+        dW_r = torch.einsum('psk,nk->psn', dZ_c, self.loadings)
+
+        # 3. DEFINE SIMULATION BLOCK
+        def _simulate(zv, wr, kern, vcomp, f0, alphas):
+            fBm = torch.matmul(zv, kern.T)
+            unit_vols = torch.exp(self.nus[0] * fBm - vcomp)
+            v2_dt = (unit_vols ** 2 * dt).unsqueeze(-1)
             
             if freeze_drift:
-                # --- FROZEN DRIFT ---
-                omega = (self.tau * alphas) / (1.0 + self.tau * f0)
-                drift_weights = torch.matmul(self.Lambda_upper, omega)
-                mu_0 = -alphas * drift_weights 
-                
-                drift_term = mu_0.unsqueeze(0).unsqueeze(0) * V2_dt.unsqueeze(-1)
-                martingale_term = alphas * dM
-                
-                dF = drift_term + martingale_term
-                f0_expanded = f0.expand(n_paths, 1, self.N)
-                return torch.cat([f0_expanded, f0 + torch.cumsum(dF, dim=1)], dim=1)
-                
+                mu_0 = -alphas * torch.matmul(self.Lambda_upper, (self.tau * alphas) / (1.0 + self.tau * f0))
+                dF = mu_0.view(1, 1, -1) * v2_dt
+                dF.add_(wr * (unit_vols.unsqueeze(-1) * alphas))
+                return torch.cat([f0.expand(n_paths, 1, -1), f0 + torch.cumsum(dF, dim=1)], dim=1)
             else:
-                # --- UNFROZEN EXACT DRIFT ---
                 F_t = f0.expand(n_paths, self.N).clone()
-                paths = [F_t.unsqueeze(1)]
-                
-                for step in range(n_steps):
-                    omega = (self.tau * alphas) / (1.0 + self.tau * F_t)
-                    drift_weights = torch.einsum('ij,pj->pi', self.Lambda_upper, omega)
-                    mu_t = -alphas * drift_weights * V2_dt[:, step].unsqueeze(1)
-                    
-                    dF_t = mu_t + alphas * dM[:, step, :]
-                    F_t = F_t + dF_t
-                    paths.append(F_t.unsqueeze(1))
-                    
-                return torch.cat(paths, dim=1)
+                res = [F_t.unsqueeze(1)]
+                for i in range(n_steps):
+                    drift = -alphas * torch.matmul(self.Lambda_upper, (self.tau * alphas) / (1.0 + self.tau * F_t)) * v2_dt[:, i]
+                    F_t = F_t + drift + wr[:, i] * (unit_vols[:, i:i+1] * alphas)
+                    res.append(F_t.unsqueeze(1))
+                return torch.cat(res, dim=1)
 
-        # 3. Apply Checkpointing if enabled and gradients are being tracked
+        # FIX: Passing all 6 required arguments to _simulate
         if use_checkpoint and torch.is_grad_enabled():
             import torch.utils.checkpoint as cp
-            # use_reentrant=False is the modern PyTorch standard for stable AAD graphs
-            return cp.checkpoint(_simulate, u_shocks, self.F0, self.alphas, use_reentrant=False)
+            return cp.checkpoint(_simulate, dW_v, dW_r, kernel, var_comp, self.F0, self.alphas, use_reentrant=False)
         else:
-            return _simulate(u_shocks, self.F0, self.alphas)
+            return _simulate(dW_v, dW_r, kernel, var_comp, self.F0, self.alphas)

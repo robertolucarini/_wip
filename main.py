@@ -1,4 +1,11 @@
 import torch
+import os
+torch.set_num_threads(os.cpu_count()) 
+# Enable MKL/OpenMP optimizations
+torch.backends.cudnn.benchmark = True
+import warnings
+# Suppress the specific PyTorch checkpointing FutureWarning
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch.utils.checkpoint")
 import numpy as np
 import time
 from src.utils import print_summary_table, print_greek_ladder, load_discount_curve, bootstrap_forward_rates, load_swaption_vol_surface
@@ -6,6 +13,8 @@ from src.calibration import RoughSABRCalibrator
 from src.torch_model import TorchRoughSABR_FMM
 from src.pricers import torch_bermudan_pricer, torch_bachelier
 from config import CHECK_MC, CHECK_DRIFT
+# Optimize for your local CPU
+
 
 if __name__ == "__main__":
     t_init = time.time()
@@ -36,11 +45,15 @@ if __name__ == "__main__":
     
     n_paths = 4096 #16384
     # 5-Year Simulation with Daily Steps
-    time_grid = torch.linspace(0.0, 5.0, 5*252, dtype=torch.float64, device=device)
+    n_steps_per_year = 25 
+    time_grid = torch.linspace(0.0, 5.0, 5 * n_steps_per_year + 1, dtype=torch.float64, device=device)
+
+    n_paths_test = 4096 
     
     if CHECK_DRIFT:
-        # We use torch.no_grad() for the performance test to prevent tracking massive graphs
         with torch.no_grad():
+            F_paths_frozen = model.simulate_forward_curve(n_paths_test, time_grid, freeze_drift=True)
+
             # Simulate 1: Frozen Drift (Deterministic Weights)
             t0_frozen = time.time()
             F_paths_frozen = model.simulate_forward_curve(n_paths, time_grid, freeze_drift=True)
@@ -107,12 +120,12 @@ if __name__ == "__main__":
     # --- 5. BERMUDAN PRICING & AAD GREEKS ---
     # Underlying: 1Y into 29Y swap (Physical Settlement)
     specs = {'Strike': F0_rates[1], 'Ex_Dates': [1.0, 2.0, 3.0, 4.0, 5.0]}
-    
-    # Run AAD Pricer
-    # This automatically tracks gradients and uses the fast, Frozen Drift model 
-    price = torch_bermudan_pricer(model, specs, n_paths, time_grid)
+
+    n_paths_pricer = 16384
+    price = torch_bermudan_pricer(model, specs, n_paths_pricer, time_grid, use_checkpoint=False)
     price.backward()
 
+    
     # --- 6. FINAL REPORTING ---
     print_summary_table("BERMUDAN PRICING", {
         "Bermudan Price (bps)": price.item() * 10000,
