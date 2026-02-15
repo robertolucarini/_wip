@@ -20,24 +20,21 @@ def torch_bachelier(F, K, T, vol):
 def torch_bermudan_pricer(model, trade_specs, n_paths, time_grid):
     """
     High-performance AAD Bermudan Pricer.
-    Reconstructs the forward curve on-the-fly to maintain the gradient chain 
-    between the price and the bucketed F0/Alpha parameters.
+    Uses pre-simulated, Arbitrage-Free FMM paths under the Terminal Measure.
     """
     log_progress("Action", "Starting Accelerated Bermudan Pricing...", 0)
     
     # 1. Simulation Phase
-    log_progress("Simulation", f"Initializing {n_paths} paths...", 1)
-    # Generates a unit driver (stochastic part)
-    unit_driver = model.generate_rough_shocks(n_paths, time_grid)
-    
-    log_progress("Simulation", f"Calculating Rough Vol kernel (H={model.H.item():.4f})...", 1)
-    log_progress("Simulation", f"Evolving {model.N} tenors...", 1)
+    log_progress("Simulation", f"Generating {n_paths} FMM paths...", 1)
+    # Generate the full arbitrage-free curve (Shape: n_paths, n_steps, n_tenors)
+    F_paths = model.simulate_forward_curve(n_paths, time_grid, freeze_drift=True)
 
     # 2. Setup Exercise Logic
     strike = torch.tensor(trade_specs['Strike'], device=model.device, dtype=torch.float64)
     ex_dates = torch.tensor(trade_specs['Ex_Dates'], device=model.device, dtype=torch.float64)
+    
     # Map dates to grid indices
-    ex_steps = [torch.argmin(torch.abs(time_grid - d)) for d in ex_dates]
+    ex_steps = [torch.argmin(torch.abs(time_grid - d)).item() for d in ex_dates]
     n_ex = len(ex_steps)
 
     # Cashflow container (deflated by the terminal numeraire)
@@ -48,23 +45,24 @@ def torch_bermudan_pricer(model, trade_specs, n_paths, time_grid):
     # 3. Backward Induction Loop (LSM)
     for i in range(n_ex - 1, -1, -1):
         step = ex_steps[i]
-        t_now = time_grid[step]
+        t_now = time_grid[step].item()
         log_progress("LSM", f"Processing Expiry T={t_now:.2f}Y ({n_ex - i}/{n_ex})", 2)
         
         # Determine the index of the first active tenor in the forward market model
         k_idx = torch.sum(model.T[:-1] <= t_now).int().item()
         
-        # RECONSTRUCTION: Reconnect F_t to model.F0 and model.alphas
-        # F(t, T) = F(0, T) + alpha(T) * Integrated_Shocks(t)
-        F_t = model.F0[k_idx:] + model.alphas[k_idx:] * unit_driver[:, step].unsqueeze(-1)
+        # EXTRACT: Grab the active forward curve directly from the simulated paths
+        F_t = F_paths[:, step, k_idx:]
         
         # Local discount factors and payoff
         taus = model.tau[k_idx:]
         dfs = torch.cumprod(1.0 / (1.0 + taus * F_t), dim=1)
-        p_t_Tn = dfs[:, -1] # Bond to the terminal date
+        p_t_Tn = dfs[:, -1] # Realized Bond to the terminal date P(t, T_N)
         
-        # Swap payoff deflated to time t
+        # Swap payoff evaluated at time t
         swap_val = torch.sum(dfs * (F_t - strike) * taus, dim=1)
+        
+        # Deflate the intrinsic value to the terminal numeraire
         intrinsic_deflated = torch.clamp(swap_val, min=0.0) / p_t_Tn
         
         if i == n_ex - 1:
@@ -72,7 +70,6 @@ def torch_bermudan_pricer(model, trade_specs, n_paths, time_grid):
             deflated_cf = intrinsic_deflated
         else:
             # STATE VARIABLES for regression: Par rate proxy
-            # We use the full swap info to distribute gradients across the ladder
             annuity = torch.sum(dfs * taus, dim=1)
             par_rate = torch.sum(dfs * F_t * taus, dim=1) / annuity
             
