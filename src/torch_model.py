@@ -36,12 +36,29 @@ class TorchRoughSABR_FMM(nn.Module):
         n_steps = len(time_grid) - 1
         dt = (time_grid[1] - time_grid[0]).to(self.dtype)
         
-        # 1. PRE-CALCULATE VOLTERRA KERNEL (Saves millions of calculations)
+        # 1. PRE-CALCULATE VOLTERRA KERNEL (Hybrid Scheme - Bennedsen et al. 2017)
         t, s = time_grid[1:].to(self.dtype), time_grid[:-1].to(self.dtype)
         gamma_const = torch.exp(torch.lgamma(self.H + 0.5))
-        kernel = torch.pow(torch.clamp(t[:, None] - s[None, :], min=1e-12), self.H - 0.5)
+        
+        # Distances: t_i - s_j
+        dt_mat = torch.clamp(t[:, None] - s[None, :], min=0.0)
+        
+        # Hybrid Scheme Discretization:
+        # Step A: Use Midpoint power-law for the 'smooth' part (k > 1)
+        # Weight = ((k - 0.5) * dt)^(H - 0.5)
+        kernel = torch.pow(torch.clamp(dt_mat - 0.5 * dt, min=1e-12), self.H - 0.5)
+        
+        # Step B: Use Integrated singular bin for the 'singular' part (k = 1)
+        # Weight = (1/dt) * integral_{0}^{dt} x^(H-0.5) dx = dt^(H-0.5) / (H + 0.5)
+        diag_idx = torch.arange(n_steps, device=self.device)
+        kernel[diag_idx, diag_idx] = torch.pow(dt, self.H - 0.5) / (self.H + 0.5)
+        
+        # Apply Gamma normalization and causal mask
         kernel = torch.where(t[:, None] > s[None, :], kernel / gamma_const, 0.0)
-        var_comp = 0.5 * (self.nus[0]**2) * (t**(2*self.H)) / (2.0 * self.H * gamma_const**2)
+        
+        # Step C: Discrete Martingale Correction
+        # Using the discrete sum of squared weights ensures E[e^X] = 1.0 exactly
+        var_comp = 0.5 * (self.nus[0]**2) * torch.sum(kernel**2, dim=1) * dt
 
         # 2. GENERATE SHOCKS
         sobol = torch.quasirandom.SobolEngine(dimension=n_steps * (self.n_factors + 1), scramble=True, seed=seed)
@@ -66,15 +83,26 @@ class TorchRoughSABR_FMM(nn.Module):
                 dF.add_(wr * (unit_vols.unsqueeze(-1) * alphas))
                 return torch.cat([f0.expand(n_paths, 1, -1), f0 + torch.cumsum(dF, dim=1)], dim=1)
             else:
+                # --- UNFROZEN EXACT DRIFT ---
                 F_t = f0.expand(n_paths, self.N).clone()
                 res = [F_t.unsqueeze(1)]
                 for i in range(n_steps):
-                    drift = -alphas * torch.matmul(self.Lambda_upper, (self.tau * alphas) / (1.0 + self.tau * F_t)) * v2_dt[:, i]
+                    # Corrected weight calculation for path-wise broadcasting
+                    omega = (self.tau * alphas) / (1.0 + self.tau * F_t)
+                    
+                    # Use einsum to handle (N, N) matrix @ (n_paths, N) vectors
+                    drift_weights = torch.einsum('ij,pj->pi', self.Lambda_upper, omega)
+                    
+                    # Apply volatility and step size
+                    drift = -alphas * drift_weights * v2_dt[:, i]
+                    
+                    # Euler-Maruyama step
                     F_t = F_t + drift + wr[:, i] * (unit_vols[:, i:i+1] * alphas)
                     res.append(F_t.unsqueeze(1))
+                    
                 return torch.cat(res, dim=1)
 
-        # FIX: Passing all 6 required arguments to _simulate
+
         if use_checkpoint and torch.is_grad_enabled():
             import torch.utils.checkpoint as cp
             return cp.checkpoint(_simulate, dW_v, dW_r, kernel, var_comp, self.F0, self.alphas, use_reentrant=False)
