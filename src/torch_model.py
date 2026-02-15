@@ -55,7 +55,6 @@ class TorchRoughSABR_FMM(nn.Module):
         dfs = 1.0 / (1.0 + self.tau * self.F0)
         return torch.prod(dfs)
 
-
     def simulate_forward_curve(self, n_paths, time_grid, seed=56, freeze_drift=True, use_checkpoint=True):
         """ 
         Multi-Factor Arbitrage-Free Forward Market Model Simulation with AAD Checkpointing.
