@@ -44,11 +44,14 @@ class TorchRoughSABR_FMM(nn.Module):
         # Volterra Kernel integration (Roughness logic)
         t, s = time_grid[1:].to(self.dtype), time_grid[:-1].to(self.dtype)
         dt_mat = t[:, None] - s[None, :]
-        kernel = torch.where(dt_mat > 0, dt_mat**(self.H - 0.5), torch.tensor(0.0, device=self.device, dtype=self.dtype))
+        
+        import math 
+        gamma_factor = math.gamma(self.H.item() + 0.5)
+        kernel = torch.where(dt_mat > 0, dt_mat**(self.H - 0.5) / gamma_factor, torch.tensor(0.0, device=self.device, dtype=self.dtype))
         
         fBm = torch.matmul(dW_v, kernel.T)
-        var_comp = 0.5 * (self.nus[0]**2) * (t**(2*self.H))
-        
+        var_comp = 0.5 * (self.nus[0]**2) * (t**(2*self.H)) / (2.0 * self.H * (gamma_factor**2))
+
         # Unit volatility driver
         unit_vols = torch.exp(self.nus[0] * fBm - var_comp)
         
