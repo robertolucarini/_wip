@@ -32,6 +32,9 @@ class TorchRoughSABR_FMM(nn.Module):
         sobol = torch.quasirandom.SobolEngine(dimension=n_steps * 2, scramble=True, seed=seed)
         u = sobol.draw(n_paths).to(self.device).to(self.dtype)
         
+        # FIX 1: Clamp uniform draws to prevent inf / -inf from the ICDF
+        u = torch.clamp(u, min=1e-7, max=1.0 - 1e-7)
+        
         # Inverse Gaussian Transform
         from torch.distributions import Normal
         dist = Normal(torch.tensor(0.0, device=self.device, dtype=self.dtype), 
@@ -47,16 +50,24 @@ class TorchRoughSABR_FMM(nn.Module):
         
         import math 
         gamma_factor = math.gamma(self.H.item() + 0.5)
-        kernel = torch.where(dt_mat > 0, dt_mat**(self.H - 0.5) / gamma_factor, torch.tensor(0.0, device=self.device, dtype=self.dtype))
+        
+        # FIX 2: Clamp dt_mat before the fractional power to prevent 0**(-0.4) = inf
+        dt_mat_safe = torch.clamp(dt_mat, min=1e-12)
+        
+        kernel = torch.where(dt_mat > 0, dt_mat_safe**(self.H - 0.5) / gamma_factor, 
+                             torch.tensor(0.0, device=self.device, dtype=self.dtype))
         
         fBm = torch.matmul(dW_v, kernel.T)
+        
+        # (Your correctly patched compensator)
         var_comp = 0.5 * (self.nus[0]**2) * (t**(2*self.H)) / (2.0 * self.H * (gamma_factor**2))
-
+        
         # Unit volatility driver
         unit_vols = torch.exp(self.nus[0] * fBm - var_comp)
         
         ones = torch.zeros(n_paths, 1, device=self.device, dtype=self.dtype)
         return torch.cumsum(torch.cat([ones, unit_vols * dW_r], dim=1), dim=1)
+
 
     def get_terminal_bond(self):
         """ Differentiable P(0, Tn) bond """

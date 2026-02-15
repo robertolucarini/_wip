@@ -50,7 +50,7 @@ if __name__ == "__main__":
         val_grid = torch.linspace(0.0, 1.0, 252, dtype=torch.float64, device=device)
         rough_driver = model.generate_rough_shocks(16384, val_grid) # Higher paths for validation accuracy
         F_T = model.F0[1] + model.alphas[1] * rough_driver[:, -1]
-        mc_euro = model.get_terminal_bond() * torch.mean(torch.clamp(F_T - strike_atm, min=0.0))
+        mc_euro = torch.mean(torch.clamp(F_T - strike_atm, min=0.0))
 
     # --- 5. FINAL REPORTING ---
     print_greek_ladder(
