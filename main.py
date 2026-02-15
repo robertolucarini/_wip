@@ -33,7 +33,7 @@ if __name__ == "__main__":
     print(f"{'FMM DRIFT SIMULATION (FROZEN VS EXACT)':^60}")
     print("="*60)
     
-    n_paths = 4096
+    n_paths = 4096 #16384
     # 5-Year Simulation with Daily Steps
     time_grid = torch.linspace(0.0, 5.0, 5*252, dtype=torch.float64, device=device)
     
@@ -122,3 +122,6 @@ if __name__ == "__main__":
         model.alphas.grad.cpu().numpy() * 10000 * 0.0001, 
         grid_T[:-1]
     )
+
+
+    print(f"Total Runtime: {t_init - time.time()}")

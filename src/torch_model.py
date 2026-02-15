@@ -55,86 +55,84 @@ class TorchRoughSABR_FMM(nn.Module):
         dfs = 1.0 / (1.0 + self.tau * self.F0)
         return torch.prod(dfs)
 
-    def simulate_forward_curve(self, n_paths, time_grid, seed=56, freeze_drift=True):
+
+    def simulate_forward_curve(self, n_paths, time_grid, seed=56, freeze_drift=True, use_checkpoint=True):
         """ 
-        Multi-Factor Arbitrage-Free Forward Market Model Simulation.
+        Multi-Factor Arbitrage-Free Forward Market Model Simulation with AAD Checkpointing.
         """
         n_steps = len(time_grid) - 1
         dt = (time_grid[1] - time_grid[0]).to(self.dtype)
         
-        # 1. Generate QMC Sobol Shocks
-        # We need n_factors for the curve, plus 1 orthogonal shock for the rough vol
+        # 1. Generate QMC Sobol Shocks (OUTSIDE the checkpoint to guarantee deterministic backward pass)
         dimension = n_steps * (self.n_factors + 1)
         sobol = torch.quasirandom.SobolEngine(dimension=dimension, scramble=True, seed=seed)
-        u = sobol.draw(n_paths).to(self.device).to(self.dtype)
-        u = torch.clamp(u, min=1e-7, max=1.0 - 1e-7)
-        
-        from torch.distributions import Normal
-        dist = Normal(torch.tensor(0.0, device=self.device, dtype=self.dtype), 
-                      torch.tensor(1.0, device=self.device, dtype=self.dtype))
-        
-        # Shape: (n_paths, n_steps, n_factors + 1)
-        z = dist.icdf(u).view(n_paths, n_steps, self.n_factors + 1)
-        
-        # Curve Drivers (n_factors)
-        dZ_curve = z[..., :self.n_factors] * torch.sqrt(dt)
-        # Volatility Driver (Correlated to the 1st Principal Component to maintain Skew)
-        dZ_vol_perp = z[..., self.n_factors] * torch.sqrt(dt)
-        dW_v = self.rhos[0] * dZ_curve[..., 0] + torch.sqrt(1.0 - self.rhos[0]**2) * dZ_vol_perp
-        
-        # 2. Rough Volterra Kernel (Applied to Volatility factor)
-        t, s = time_grid[1:].to(self.dtype), time_grid[:-1].to(self.dtype)
-        dt_mat = torch.clamp(t[:, None] - s[None, :], min=1e-12)
-        
-        import math 
-        gamma_factor = math.gamma(self.H.item() + 0.5)
-        kernel = torch.where(t[:, None] - s[None, :] > 0, dt_mat**(self.H - 0.5) / gamma_factor, 
-                             torch.tensor(0.0, device=self.device, dtype=self.dtype))
-        
-        fBm = torch.matmul(dW_v, kernel.T)
-        var_comp = 0.5 * (self.nus[0]**2) * (t**(2*self.H)) / (2.0 * self.H * (gamma_factor**2))
-        unit_vols = torch.exp(self.nus[0] * fBm - var_comp)
-        
-        # 3. Base process components
-        V2_dt = (unit_vols ** 2) * dt  # Variance scaled by dt
-        
-        # Map K independent curve shocks to N correlated tenors using PCA Loadings
-        # Shape: (n_paths, n_steps, N)
-        dW_r = torch.einsum('psk,nk->psn', dZ_curve, self.loadings)
-        dM = unit_vols.unsqueeze(2) * dW_r  # Martingale increments
-        
-        # 4. No-Arbitrage FMM Drift & Simulation
-        if freeze_drift:
-            # --- FROZEN DRIFT (Fast Matrix Multiplication) ---
-            omega = (self.tau * self.alphas) / (1.0 + self.tau * self.F0)
+        u_shocks = sobol.draw(n_paths).to(self.device).to(self.dtype)
+        u_shocks = torch.clamp(u_shocks, min=1e-7, max=1.0 - 1e-7)
+
+        # 2. Define the exact block of math to be Checkpointed
+        def _simulate(u, f0, alphas):
+            """ Internal function that takes parameters explicitly for Autograd tracking """
+            from torch.distributions import Normal
+            dist = Normal(torch.tensor(0.0, device=self.device, dtype=self.dtype), 
+                          torch.tensor(1.0, device=self.device, dtype=self.dtype))
+            z = dist.icdf(u).view(n_paths, n_steps, self.n_factors + 1)
             
-            # The upper triangular dot product exactly computes sum(Lambda_ij * omega_j) for j > i
-            drift_weights = torch.matmul(self.Lambda_upper, omega)
-            mu_0 = -self.alphas * drift_weights 
+            # Curve Drivers & Volatility Driver
+            dZ_curve = z[..., :self.n_factors] * torch.sqrt(dt)
+            dZ_vol_perp = z[..., self.n_factors] * torch.sqrt(dt)
+            dW_v = self.rhos[0] * dZ_curve[..., 0] + torch.sqrt(1.0 - self.rhos[0]**2) * dZ_vol_perp
             
-            drift_term = mu_0.unsqueeze(0).unsqueeze(0) * V2_dt.unsqueeze(-1)
-            martingale_term = self.alphas * dM
+            # Rough Volterra Kernel
+            t, s = time_grid[1:].to(self.dtype), time_grid[:-1].to(self.dtype)
+            dt_mat = torch.clamp(t[:, None] - s[None, :], min=1e-12)
             
-            dF = drift_term + martingale_term
-            F_0_expanded = self.F0.expand(n_paths, 1, self.N)
-            F_paths = torch.cat([F_0_expanded, self.F0 + torch.cumsum(dF, dim=1)], dim=1)
+            import math 
+            gamma_factor = math.gamma(self.H.item() + 0.5)
+            kernel = torch.where(t[:, None] - s[None, :] > 0, dt_mat**(self.H - 0.5) / gamma_factor, 
+                                 torch.tensor(0.0, device=self.device, dtype=self.dtype))
             
+            fBm = torch.matmul(dW_v, kernel.T)
+            var_comp = 0.5 * (self.nus[0]**2) * (t**(2*self.H)) / (2.0 * self.H * (gamma_factor**2))
+            unit_vols = torch.exp(self.nus[0] * fBm - var_comp)
+            
+            V2_dt = (unit_vols ** 2) * dt  
+            
+            dW_r = torch.einsum('psk,nk->psn', dZ_curve, self.loadings)
+            dM = unit_vols.unsqueeze(2) * dW_r  
+            
+            if freeze_drift:
+                # --- FROZEN DRIFT ---
+                omega = (self.tau * alphas) / (1.0 + self.tau * f0)
+                drift_weights = torch.matmul(self.Lambda_upper, omega)
+                mu_0 = -alphas * drift_weights 
+                
+                drift_term = mu_0.unsqueeze(0).unsqueeze(0) * V2_dt.unsqueeze(-1)
+                martingale_term = alphas * dM
+                
+                dF = drift_term + martingale_term
+                f0_expanded = f0.expand(n_paths, 1, self.N)
+                return torch.cat([f0_expanded, f0 + torch.cumsum(dF, dim=1)], dim=1)
+                
+            else:
+                # --- UNFROZEN EXACT DRIFT ---
+                F_t = f0.expand(n_paths, self.N).clone()
+                paths = [F_t.unsqueeze(1)]
+                
+                for step in range(n_steps):
+                    omega = (self.tau * alphas) / (1.0 + self.tau * F_t)
+                    drift_weights = torch.einsum('ij,pj->pi', self.Lambda_upper, omega)
+                    mu_t = -alphas * drift_weights * V2_dt[:, step].unsqueeze(1)
+                    
+                    dF_t = mu_t + alphas * dM[:, step, :]
+                    F_t = F_t + dF_t
+                    paths.append(F_t.unsqueeze(1))
+                    
+                return torch.cat(paths, dim=1)
+
+        # 3. Apply Checkpointing if enabled and gradients are being tracked
+        if use_checkpoint and torch.is_grad_enabled():
+            import torch.utils.checkpoint as cp
+            # use_reentrant=False is the modern PyTorch standard for stable AAD graphs
+            return cp.checkpoint(_simulate, u_shocks, self.F0, self.alphas, use_reentrant=False)
         else:
-            # --- UNFROZEN EXACT DRIFT ---
-            F_t = self.F0.expand(n_paths, self.N).clone()
-            F_paths = [F_t.unsqueeze(1)]
-            
-            for step in range(n_steps):
-                omega = (self.tau * self.alphas) / (1.0 + self.tau * F_t)
-                
-                # Dynamic batch matrix multiplication
-                drift_weights = torch.einsum('ij,pj->pi', self.Lambda_upper, omega)
-                mu_t = -self.alphas * drift_weights * V2_dt[:, step].unsqueeze(1)
-                
-                dF_t = mu_t + self.alphas * dM[:, step, :]
-                F_t = F_t + dF_t
-                F_paths.append(F_t.unsqueeze(1))
-                
-            F_paths = torch.cat(F_paths, dim=1)
-            
-        return F_paths
+            return _simulate(u_shocks, self.F0, self.alphas)
