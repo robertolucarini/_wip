@@ -22,10 +22,15 @@ class TorchRoughSABR_FMM(nn.Module):
 
         # PCA Setup
         T_mat_i, T_mat_j = self.T[:-1].unsqueeze(1), self.T[:-1].unsqueeze(0)
+        # rate-rate corr
         spatial_corr = torch.exp(-beta * torch.abs(T_mat_i - T_mat_j))
+        # eigen decomposition
         evals, evecs = torch.linalg.eigh(spatial_corr)
+        # sort
         idx = torch.argsort(evals, descending=True)
+        # pca loadings
         loadings = evecs[:, idx[:n_factors]] * torch.sqrt(torch.clamp(evals[idx[:n_factors]], min=0.0)).unsqueeze(0)
+
         self.register_buffer('loadings', loadings / torch.sqrt(torch.sum(loadings**2, dim=1, keepdim=True)))
         self.register_buffer('Lambda_upper', torch.triu(self.loadings @ self.loadings.T, diagonal=1))
 
@@ -37,12 +42,20 @@ class TorchRoughSABR_FMM(nn.Module):
         dt = (time_grid[1] - time_grid[0]).to(self.dtype)
         
         # 1. Pre-calculate Kernel & Martingale Correction
+        # t > s
         t, s = time_grid[1:].to(self.dtype), time_grid[:-1].to(self.dtype)
+        # Gamma func
         gamma_const = torch.exp(torch.lgamma(self.H + 0.5))
+        # control for negative times
         dt_mat = torch.clamp(t[:, None] - s[None, :], min=0.0)
+        # power-low decay: dt**(H - 0.5) 
+        # kernel at midpoint of the integration interval: t_i - s_j - 1/2*dt
         kernel = torch.pow(torch.clamp(dt_mat - 0.5 * dt, min=1e-12), self.H - 0.5)
+        # diagonal distances indexes
         diag_idx = torch.arange(n_steps, device=self.device)
+        # integrate kernel analytically over interval [0, dt]
         kernel[diag_idx, diag_idx] = torch.pow(dt, self.H - 0.5) / (self.H + 0.5)
+        # divide kernel matrix by gamma func and zero-out the upper-triangle 
         kernel = torch.where(t[:, None] > s[None, :], kernel / gamma_const, 0.0)
         
         # Discrete Martingale Correction (remains N x Steps)
