@@ -38,6 +38,8 @@ class TorchRoughSABR_FMM(nn.Module):
         return torch.prod(1.0 / (1.0 + self.tau * self.F0))
 
     def simulate_forward_curve(self, n_paths, time_grid, seed=56, freeze_drift=True, use_checkpoint=False):
+        from torch.distributions import Normal
+
         n_steps = len(time_grid) - 1
         dt = (time_grid[1] - time_grid[0]).to(self.dtype)
         
@@ -61,25 +63,32 @@ class TorchRoughSABR_FMM(nn.Module):
         # Discrete Martingale Correction (remains N x Steps)
         var_comp = 0.5 * (self.nus**2).unsqueeze(-1) * torch.sum(kernel**2, dim=1).unsqueeze(0) * dt
 
-        # 2. Generate Shocks
+        # sobol generator
         sobol = torch.quasirandom.SobolEngine(dimension=n_steps * (self.n_factors + 1), scramble=True, seed=seed)
+        # draws
         u = sobol.draw(n_paths).to(self.device).to(self.dtype)
-        from torch.distributions import Normal
+        # from uniform to standard normal distribution
         dist = Normal(torch.tensor(0.0, device=self.device), torch.tensor(1.0, device=self.device))
+        # shocks
         z = dist.icdf(torch.clamp(u, 1e-7, 1-1e-7)).view(n_paths, n_steps, self.n_factors + 1)
         
-        # Shocks for factors and perp noise
+        # time-scaled shocks
+        # macro factors
         dz_curve = z[..., :self.n_factors] * torch.sqrt(dt)
+        # idio factor
         dz_perp = z[..., self.n_factors:self.n_factors+1] * torch.sqrt(dt)
         
-        # Rate noise projection (used for dF)
+        # dZ @ L.T  
         dW_r = torch.matmul(dz_curve, self.loadings.T)
 
         # 3. Define Simulation Block
         def _simulate(dz_c, dz_p, wr, kern, vcomp, f0, alphas):
             # SPEED OPTIMIZATION: Factorized Rough Volatility
             # Calculate 4 rough drivers (3 factors + 1 orthogonal) instead of 31
+            # shocks -> (n_paths, n_steps, n_factors)
             dz_all = torch.cat([dz_c, dz_p], dim=-1)
+            # Kernel * dZ
+            # (n_paths, n_steps, n_factors)
             fbm_4 = torch.matmul(dz_all.transpose(1, 2), kern.T).transpose(1, 2)
             
             # Reconstruct tenor fBms: fBm_i = rho_i * (sum L_ik * fBm_k) + sqrt(1-rho^2) * fBm_p
