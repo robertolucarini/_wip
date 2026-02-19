@@ -1,3 +1,3 @@
 
-CHECK_MC = False
+CHECK_MC = True
 CHECK_DRIFT = False

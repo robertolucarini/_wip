@@ -25,7 +25,7 @@ if __name__ == "__main__":
     vol_matrix = load_swaption_vol_surface("data/estr_vol_full_strikes.csv", 1.0)
     
     calibrator = RoughSABRCalibrator(vol_matrix)
-    calib = calibrator.calibrate()
+    calib = calibrator.calibrate(method='ODE')
 
     print_summary_table("ROUGH SABR CALIBRATION", {
         "Global Hurst (H)": calib['H'],

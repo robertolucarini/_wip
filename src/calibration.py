@@ -36,54 +36,120 @@ class RoughSABRCalibrator:
         
         return alpha * (1.0 + skew + smile + drift)
 
-    def _obj(self, p):
-        # Unpack params: [rho_1...rho_n, nu_1...nu_n, H]
-        rhos, nus, H = p[:self.n_exp], p[self.n_exp:2*self.n_exp], p[-1]
+
+    def rough_sabr_vol_ode(self, k, T, alpha, rho, nu, H):
+        """ 
+        Advanced Rough SABR closed-form approximation using the ODE solution 
+        from Fukasawa & Gatheral (2022).
+        """
+        # Calculate the scaled moneyness y
+        y = (nu * (T**(H - 0.5)) * k) / alpha
         
-        # Interpolate rho(T) and nu(T) term structures
+        # Clip rho for numerical stability in log and arctan operations
+        rho_safe = np.clip(rho, -0.9999, 0.9999)
+        
+        def G_half(z):
+            inner = np.sqrt(1.0 + rho_safe * z + z**2 / 4.0) - rho_safe - z / 2.0
+            return 4.0 * (np.log(inner / (1.0 - rho_safe)))**2
+            
+        def G_zero(z):
+            term1 = np.log(1.0 + 2.0 * rho_safe * z + z**2)
+            denom = np.sqrt(1.0 - rho_safe**2)
+            term2 = (2.0 * rho_safe / denom) * (np.arctan(rho_safe / denom) - np.arctan((z + rho_safe) / denom))
+            return term1 + term2
+
+        # Avoid division by zero at exactly ATM (k=0)
+        safe_y = np.where(np.abs(y) < 1e-12, 1e-12, y)
+        
+        z0 = safe_y / (2.0 * H + 1.0)
+        z_half = 2.0 * safe_y / (2.0 * H + 1.0)
+        
+        w0 = 3.0 * (1.0 - 2.0 * H) / (2.0 * H + 3.0)
+        w_half = 2.0 * H / (2.0 * H + 3.0)
+        
+        # Interpolate between H=0 and H=1/2 extreme solutions
+        G_A = ((2.0 * H + 1.0)**2) * (w0 * G_zero(z0) + w_half * G_half(z_half))
+        
+        # Prevent floating-point negatives and division-by-zero
+        G_A_safe = np.clip(G_A, a_min=1e-14, a_max=None)
+        
+        # The limit of |y|/sqrt(G_A) as y -> 0 is 1.0
+        ratio = np.where(np.abs(y) < 1e-12, 1.0, np.abs(safe_y) / np.sqrt(G_A_safe))
+
+        
+        return alpha * ratio
+
+
+    def _obj(self, p, H, method):
+        # Unpack params: [rho_1...rho_n, nu_global]
+        rhos, nu_global = p[:self.n_exp], p[-1]
+        
+        # Interpolate rho(T) term structure
         r_ts = PchipInterpolator(self.expiries, rhos, extrapolate=True)
-        n_ts = PchipInterpolator(self.expiries, nus, extrapolate=True)
         
-        # Evaluate model vols across the grid
-        v = self.rough_sabr_vol(
-            self.K_flat, self.T_flat, 
-            self.alpha_ts(self.T_flat), 
-            r_ts(self.T_flat), 
-            n_ts(self.T_flat), 
-            H
-        )
+        # Select the pricing method
+        if method == 'polynomial':
+            v = self.rough_sabr_vol(
+                self.K_flat, self.T_flat, 
+                self.alpha_ts(self.T_flat), 
+                r_ts(self.T_flat), 
+                nu_global, 
+                H
+            )
+        elif method == 'ODE':
+            v = self.rough_sabr_vol_ode(
+                self.K_flat, self.T_flat, 
+                self.alpha_ts(self.T_flat), 
+                r_ts(self.T_flat), 
+                nu_global, 
+                H
+            )
+        else:
+            raise ValueError(f"Unknown calibration method: {method}")
+            
         return (v - self.market_vols) * 10000.0
 
-    def calibrate(self):
+    def calibrate(self, method='ODE', H_grid=np.array([0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50])):
         print("\n" + "="*60)
-        print(f"{'ROUGH SABR CALIBRATION (TERM STRUCTURE)':^60}")
+        print(f"{f'ROUGH SABR CALIBRATION (GLOBAL NU | {method.upper()})':^60}")
         print("="*60)
         
-        # Initial guess: [Rhos, Nus, H]
-        guess = np.concatenate([np.full(self.n_exp, -0.1), np.full(self.n_exp, 0.4), [0.1]])
+        best_rmse = np.inf
+        best_H = None
+        best_res = None
         
-        # PINNING H: Tighten the Hurst bound to stay in the highly rough regime (H <= 0.25)
-        low_bounds = np.concatenate([np.full(self.n_exp, -0.99), np.full(self.n_exp, 0.001), [0.01]])
-        high_bounds = np.concatenate([np.full(self.n_exp, 0.99), np.full(self.n_exp, 5.0), [0.25]])
+        # Initial guess: [Rhos, Nu_global]
+        guess = np.concatenate([np.full(self.n_exp, -0.1), [0.4]])
+        low_bounds = np.concatenate([np.full(self.n_exp, -0.99), [0.001]])
+        high_bounds = np.concatenate([np.full(self.n_exp, 0.99), [5.0]])
         
-        res = least_squares(
-            self._obj, guess, 
-            bounds=(low_bounds, high_bounds), 
-            ftol=1e-10, xtol=1e-10
-        )
-        
-        rmse = np.sqrt(np.mean(res.fun**2))
-        H_opt = res.x[-1]
-        
+        # Discrete Grid Search over Hurst exponent
+        for H in H_grid:
+            res = least_squares(
+                self._obj, guess, args=(H, method),
+                bounds=(low_bounds, high_bounds), 
+                ftol=1e-10, xtol=1e-10
+            )
+            rmse = np.sqrt(np.mean(res.fun**2))
+            
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best_H = H
+                best_res = res
+                
         print(f"Status : SUCCESS")
-        print(f"Global Hurst (H): {H_opt:.6f}")
-        print(f"RMSE           : {rmse:.4f} bps")
+        print(f"Global Hurst (H): {best_H:.6f}")
+        print(f"Global Nu       : {best_res.x[-1]:.4f}")
+        print(f"RMSE            : {best_rmse:.4f} bps")
         
-        # Fixed: Returning 'rmse_bps' to prevent KeyError in main.py
+        best_rhos = best_res.x[:self.n_exp]
+        best_nu = best_res.x[-1]
+        
         return {
             'alpha_func': self.alpha_ts, 
-            'H': H_opt, 
-            'rmse_bps': rmse,
-            'rho_func': PchipInterpolator(self.expiries, res.x[:self.n_exp], extrapolate=True),
-            'nu_func': PchipInterpolator(self.expiries, res.x[self.n_exp:2*self.n_exp], extrapolate=True)
+            'H': best_H, 
+            'rmse_bps': best_rmse,
+            'rho_func': PchipInterpolator(self.expiries, best_rhos, extrapolate=True),
+            # Returning constant interpolator for nu to keep downstream FMM compatibility 
+            'nu_func': PchipInterpolator(self.expiries, np.full(self.n_exp, best_nu), extrapolate=True)
         }
