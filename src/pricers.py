@@ -12,6 +12,7 @@ def torch_bachelier(F, K, T, vol):
     
     return (F - K) * dist.cdf(d) + std_dev * torch.exp(dist.log_prob(d))
 
+
 def torch_bermudan_pricer(model, trade_specs, n_paths, time_grid, use_checkpoint=False):
     """
     High-performance AAD Bermudan Pricer.
@@ -39,14 +40,19 @@ def torch_bermudan_pricer(model, trade_specs, n_paths, time_grid, use_checkpoint
         t_now = time_grid[step].item()
         log_progress("LSM", f"Processing Expiry T={t_now:.2f}Y ({n_ex - i}/{n_ex})", 2)
         
+        # exercise date
         k_idx = torch.sum(model.T[:-1] <= t_now).int().item()
+        # simulated forward rates
         F_t = F_paths[:, step, k_idx:]
-        
+        # dt
         taus = model.tau[k_idx:]
+        # cumulative stochastic discount factor
         dfs = torch.cumprod(1.0 / (1.0 + taus * F_t), dim=1)
+        # numeraire
         p_t_Tn = dfs[:, -1] 
-        
+        # swap value
         swap_val = torch.sum(dfs * (F_t - strike) * taus, dim=1)
+        # swaption deflated value
         intrinsic_deflated = torch.clamp(swap_val, min=0.0) / p_t_Tn
         
         if i == n_ex - 1:
@@ -70,4 +76,4 @@ def torch_bermudan_pricer(model, trade_specs, n_paths, time_grid, use_checkpoint
 
     log_progress("AAD", "Computing Greeks via backward pass...", 0)
     p0_Tn = model.get_terminal_bond()
-    return p0_Tn * torch.mean(deflated_cf)
+    return p0_Tn * torch.mean(deflated_cf)  
