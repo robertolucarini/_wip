@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 
 class TorchRoughSABR_FMM(nn.Module):
-    def __init__(self, tenors, F0, alpha_f, rho_f, nu_f, H, beta=0.05, n_factors=3, device='cpu'):
+    def __init__(self, tenors, F0, alpha_f, rho_f, nu_f, H, beta=0.05, beta_sabr=0.5, shift=0.0, n_factors=3, device='cpu'):
         super().__init__()
         self.device = device
         self.dtype = torch.float64
@@ -19,6 +19,8 @@ class TorchRoughSABR_FMM(nn.Module):
         self.register_buffer('rhos', torch.tensor(rho_f(tenors[:-1]), device=device, dtype=self.dtype))
         self.register_buffer('nus', torch.tensor(nu_f(tenors[:-1]), device=device, dtype=self.dtype))
         self.register_buffer('H', torch.tensor(H, device=device, dtype=self.dtype))
+        self.register_buffer('beta_sabr', torch.tensor(beta_sabr, device=device, dtype=self.dtype))
+        self.register_buffer('shift', torch.tensor(shift, device=device, dtype=self.dtype))
 
         # PCA Setup
         T_mat_i, T_mat_j = self.T[:-1].unsqueeze(1), self.T[:-1].unsqueeze(0)
@@ -100,21 +102,37 @@ class TorchRoughSABR_FMM(nn.Module):
             v2_dt = (unit_vols ** 2 * dt)
             
             if freeze_drift:
-                mu_0 = -alphas * torch.matmul(self.Lambda_upper, (self.tau * alphas) / (1.0 + self.tau * f0))
-                # Use in-place ops for memory speed
+                # 1. Calculate the shifted SABR local vol component for the frozen initial curve
+                eta_f0 = torch.pow(torch.abs(f0 + self.shift), self.beta_sabr)
+                vol_scale = alphas * eta_f0
+                
+                # 2. Apply it to the drift (omega)
+                omega_0 = (self.tau * vol_scale) / (1.0 + self.tau * f0)
+                mu_0 = -vol_scale * torch.matmul(self.Lambda_upper, omega_0)
+                
                 dF = mu_0.view(1, 1, -1) * v2_dt
-                dF.add_(wr * (unit_vols * alphas.view(1, 1, -1)))
+                # 3. Apply it to the diffusion (shock)
+                dF.add_(wr * (unit_vols * vol_scale.view(1, 1, -1)))
                 return torch.cat([f0.expand(n_paths, 1, -1), f0 + torch.cumsum(dF, dim=1)], dim=1)
+            
             else:
                 F_t = f0.expand(n_paths, self.N).clone()
                 res = [F_t.unsqueeze(1)]
                 for i in range(n_steps):
-                    omega = (self.tau * alphas) / (1.0 + self.tau * F_t)
+                    # 1. Dynamic local vol component evaluated at current F_t
+                    eta_F = torch.pow(torch.abs(F_t + self.shift), self.beta_sabr)
+                    vol_scale = alphas * eta_F
+                    
+                    # 2. Dynamic drift adjustment
+                    omega = (self.tau * vol_scale) / (1.0 + self.tau * F_t)
                     drift_weights = torch.einsum('ij,pj->pi', self.Lambda_upper, omega)
-                    drift = -alphas * drift_weights * v2_dt[:, i]
-                    F_t = F_t + drift + wr[:, i] * (unit_vols[:, i] * alphas)
+                    drift = -vol_scale * drift_weights * v2_dt[:, i]
+                    
+                    # 3. Dynamic diffusion adjustment
+                    F_t = F_t + drift + wr[:, i] * (unit_vols[:, i] * vol_scale)
                     res.append(F_t.unsqueeze(1))
                 return torch.cat(res, dim=1)
+            
 
         if use_checkpoint and torch.is_grad_enabled():
             import torch.utils.checkpoint as cp
