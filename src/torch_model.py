@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 
 class TorchRoughSABR_FMM(nn.Module):
-    def __init__(self, tenors, F0, alpha_f, rho_f, nu_f, H, beta=0.05, beta_sabr=0.5, shift=0.0, n_factors=3, device='cpu'):
+    def __init__(self, tenors, F0, alpha_f, rho_f, nu_f, H, beta_decay=0.05, beta_sabr=0.5, shift=0.0, n_factors=3, device='cpu'):
         super().__init__()
         self.device = device
         self.dtype = torch.float64
@@ -25,7 +25,7 @@ class TorchRoughSABR_FMM(nn.Module):
         # PCA Setup
         T_mat_i, T_mat_j = self.T[:-1].unsqueeze(1), self.T[:-1].unsqueeze(0)
         # rate-rate corr
-        spatial_corr = torch.exp(-beta * torch.abs(T_mat_i - T_mat_j))
+        spatial_corr = torch.exp(-beta_decay * torch.abs(T_mat_i - T_mat_j))
         # eigen decomposition
         evals, evecs = torch.linalg.eigh(spatial_corr)
         # sort

@@ -35,7 +35,8 @@ if __name__ == "__main__":
 
     # --- 2. MODEL SETUP ---
     model = TorchRoughSABR_FMM(grid_T, F0_rates, calib['alpha_func'], 
-                               calib['rho_func'], calib['nu_func'], calib['H'], device=device)
+                               calib['rho_func'], calib['nu_func'], calib['H'], 
+                               beta_sabr=0.5, shift=0.0, device=device)
 
     # --- 3. SIMULATION FOR DIAGNOSTICS ---
     # Common settings for diagnostic checks
@@ -81,7 +82,7 @@ if __name__ == "__main__":
             "Exact Mean (bps)": mean_fwd_unfrozen * 10000,
             "Drift Difference (bps)": abs(mean_fwd_unfrozen - mean_fwd_frozen) * 10000
         })
-# --- 4b. ROUGHNESS SENSITIVITY CHECK (Convergence to H=0.5) ---
+    # --- 4b. ROUGHNESS SENSITIVITY CHECK (Convergence to H=0.5) ---
     # This proves that the gap is due to roughness, not a bug.
     CHECK_LIMIT = True # Toggle this for one-off validation
     if CHECK_LIMIT:
@@ -100,15 +101,21 @@ if __name__ == "__main__":
             idx_1y = torch.argmin(torch.abs(torch.tensor(grid_T) - 1.0)).item()
             step_1y = torch.argmin(torch.abs(time_grid - 1.0)).item()
             
+            # --- DIAGNOSTIC ADJUSTMENT FOR CEV / LOCAL VOL ---
+            # Translate the base alpha into an effective Normal alpha at ATM
+            eta_F0 = torch.pow(torch.abs(model.F0[idx_1y] + model.shift), model.beta_sabr).item()
+            effective_alpha = model.alphas[idx_1y].item() * eta_F0
+            
             v_classical = calibrator.rough_sabr_vol(
                 k=0.0, T=1.0, 
-                alpha=model.alphas[idx_1y].item(), 
+                alpha=effective_alpha, 
                 rho=model.rhos[idx_1y].item(), 
                 nu=model.nus[idx_1y].item(), 
                 H=0.5 # Force H=0.5 in analytical too
             )
             analytical_limit = torch_bachelier(model.F0[idx_1y], model.F0[idx_1y], 
                                                torch.tensor(1.0, device=device), torch.tensor(v_classical, device=device))
+            
             
             # MC Price at H=0.5
             F_1y_at_1y = F_paths_limit[:, step_1y, idx_1y]
