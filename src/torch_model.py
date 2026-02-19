@@ -39,26 +39,43 @@ class TorchRoughSABR_FMM(nn.Module):
     def get_terminal_bond(self):
         return torch.prod(1.0 / (1.0 + self.tau * self.F0))
 
-    def simulate_forward_curve(self, n_paths, time_grid, seed=56, freeze_drift=True, use_checkpoint=False):
+    def simulate_forward_curve(self, n_paths, time_grid, seed=56, freeze_drift=True, use_checkpoint=False, scheme='hybrid', kappa=1, b_eval='optimal'):
         from torch.distributions import Normal
 
         n_steps = len(time_grid) - 1
         dt = (time_grid[1] - time_grid[0]).to(self.dtype)
         
         # 1. Pre-calculate Kernel & Martingale Correction
-        # t > s
         t, s = time_grid[1:].to(self.dtype), time_grid[:-1].to(self.dtype)
-        # Gamma func
         gamma_const = torch.exp(torch.lgamma(self.H + 0.5))
-        # control for negative times
-        dt_mat = torch.clamp(t[:, None] - s[None, :], min=0.0)
-        # power-low decay: dt**(H - 0.5) 
-        # kernel at midpoint of the integration interval: t_i - s_j - 1/2*dt
-        kernel = torch.pow(torch.clamp(dt_mat - 0.5 * dt, min=1e-12), self.H - 0.5)
-        # diagonal distances indexes
+        alpha = self.H - 0.5
         diag_idx = torch.arange(n_steps, device=self.device)
-        # integrate kernel analytically over interval [0, dt]
-        kernel[diag_idx, diag_idx] = torch.pow(dt, self.H - 0.5) / (self.H + 0.5)
+        
+        if scheme == 'hybrid':
+            # Hybrid Scheme (Bennedsen et al. 2017)
+            # k_mat represents the lag step k = 1, 2, ...
+            k_mat = torch.clamp(diag_idx[:, None] - diag_idx[None, :] + 1, min=0.0).to(self.dtype)
+
+            # 1. Exact integration of power function near zero (for k <= kappa)
+            exact_weights = (torch.pow(k_mat, alpha + 1.0) - torch.pow(torch.clamp(k_mat - 1.0, min=0.0), alpha + 1.0)) / (alpha + 1.0)
+            
+            # 2. Step function evaluation (Riemann sum) elsewhere (for k > kappa)
+            if b_eval == 'optimal':
+                # Optimal evaluation points b_k^* from Proposition 2.8
+                riemann_weights = exact_weights
+            else:
+                # Forward Riemann evaluation points (b_k = k)
+                riemann_weights = torch.pow(k_mat, alpha)
+                
+            weights = torch.where(k_mat <= kappa, exact_weights, riemann_weights)
+            kernel = weights * torch.pow(dt, alpha)
+            
+        else:
+            # Modified Riemann (Original implementation)
+            dt_mat = torch.clamp(t[:, None] - s[None, :], min=0.0)
+            kernel = torch.pow(torch.clamp(dt_mat - 0.5 * dt, min=1e-12), alpha)
+            kernel[diag_idx, diag_idx] = torch.pow(dt, alpha) / (alpha + 1.0)
+
         # divide kernel matrix by gamma func and zero-out the upper-triangle 
         kernel = torch.where(t[:, None] > s[None, :], kernel / gamma_const, 0.0)
         
