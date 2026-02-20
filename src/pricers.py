@@ -1,5 +1,8 @@
 import torch
 from src.utils import log_progress
+import numpy as np
+
+
 
 def torch_bachelier(F, K, T, vol):
     """ Differentiable Bachelier price for validation and Control Variates. """
@@ -16,11 +19,12 @@ def torch_bachelier(F, K, T, vol):
 def torch_bermudan_pricer(model, trade_specs, n_paths, time_grid, use_checkpoint=False):
     """
     High-performance AAD Bermudan Pricer.
-    Updated to support the use_checkpoint flag for speed/memory control.
+    Updated to support the use_checkpoint flag for speed/memory control
+    and fixed the LSM loop to perfectly preserve the Autograd computational graph.
     """
     log_progress("Action", "Starting Accelerated Bermudan Pricing...", 0)
     
-    # 1. Simulation Phase - Pass the use_checkpoint flag here
+    # 1. Simulation Phase
     log_progress("Simulation", f"Generating {n_paths} FMM paths...", 1)
     F_paths = model.simulate_forward_curve(n_paths, time_grid, freeze_drift=True, use_checkpoint=use_checkpoint)
 
@@ -34,28 +38,23 @@ def torch_bermudan_pricer(model, trade_specs, n_paths, time_grid, use_checkpoint
     
     log_progress("LSM", f"Starting Backward Induction ({n_ex} exercise dates)...", 1)
 
-    # 3. Backward Induction Loop (LSM)
+    # 3. Backward Induction Loop (LSM) - AUTOGRAD SAFE
     for i in range(n_ex - 1, -1, -1):
         step = ex_steps[i]
         t_now = time_grid[step].item()
         log_progress("LSM", f"Processing Expiry T={t_now:.2f}Y ({n_ex - i}/{n_ex})", 2)
         
-        # exercise date
         k_idx = torch.sum(model.T[:-1] <= t_now).int().item()
-        # simulated forward rates
         F_t = F_paths[:, step, k_idx:]
-        # dt
         taus = model.tau[k_idx:]
-        # cumulative stochastic discount factor
+        
         dfs = torch.cumprod(1.0 / (1.0 + taus * F_t), dim=1)
-        # numeraire
         p_t_Tn = dfs[:, -1] 
-        # swap value
         swap_val = torch.sum(dfs * (F_t - strike) * taus, dim=1)
-        # swaption deflated value
         intrinsic_deflated = torch.clamp(swap_val, min=0.0) / p_t_Tn
         
         if i == n_ex - 1:
+            # Direct assignment creates a new reference in the graph (Safe)
             deflated_cf = intrinsic_deflated
         else:
             annuity = torch.sum(dfs * taus, dim=1)
@@ -69,18 +68,23 @@ def torch_bermudan_pricer(model, trade_specs, n_paths, time_grid, use_checkpoint
             
             itm = intrinsic_deflated > 0
             if itm.sum() > 50:
+                # Glasserman AAD standard: Detach inputs for the regression weights
                 sol = torch.linalg.lstsq(X[itm].detach(), deflated_cf[itm].detach()).solution
-                continuation = X[itm] @ sol
-                do_ex = intrinsic_deflated[itm] > continuation
-                deflated_cf[itm] = torch.where(do_ex, intrinsic_deflated[itm], deflated_cf[itm])
+                
+                # Evaluate continuation value for ALL paths (to avoid in-place indexing)
+                continuation = X @ sol
+                
+                # Global exercise mask: ITM AND payoff is strictly greater than continuation
+                do_ex = itm & (intrinsic_deflated > continuation)
+                
+                # AUTOGRAD FIX: Out-of-place global update.
+                # This safely routes the gradients through the correct exercise boundary without breaking the graph.
+                deflated_cf = torch.where(do_ex, intrinsic_deflated, deflated_cf)
 
     log_progress("AAD", "Computing Greeks via backward pass...", 0)
     p0_Tn = model.get_terminal_bond()
-    return p0_Tn * torch.mean(deflated_cf)  
+    return p0_Tn * torch.mean(deflated_cf)
 
-
-import numpy as np
-import torch
 
 def mapped_smm_pricer(model, Sigma_matrix, expiries, tenors, strike_offsets, dt=1.0/24.0, n_paths=4096):
     """
@@ -169,3 +173,100 @@ def mapped_smm_pricer(model, Sigma_matrix, expiries, tenors, strike_offsets, dt=
     alpha_np = alpha_smm.detach().cpu().numpy()
     ivs = bachelier_iv_newton(prices_np, strike_offsets, expiries, initial_guess_vol=alpha_np)    
     return ivs
+
+
+def mapped_smm_ode(model, Sigma_matrix, expiries, tenors, strike_offsets):
+    """
+    Low-Fidelity Surrogate for Stage 2 (AMMO Framework).
+    Performs the exact Adachi (2025) SMM mapping, but prices the resulting 
+    parameters using the analytical Fukasawa-Gatheral ODE proxy.
+    Fully differentiable via PyTorch Autograd.
+    """
+    device = model.device
+    dtype = model.dtype
+    n_options = len(expiries)
+    
+    # 1. Base yield curve setup
+    tau = model.tau
+    F0 = model.F0
+    P0 = torch.cumprod(torch.cat([torch.tensor([1.0], device=device, dtype=dtype), 1.0 / (1.0 + tau * F0)]), dim=0)
+    
+    eta_F0 = torch.pow(torch.abs(F0 + model.shift), model.beta_sabr)
+    alpha_normal = model.alphas * eta_F0 
+    
+    # Use lists to accumulate tensors. This preserves the Autograd computational graph!
+    alpha_smm_list = []
+    rho_smm_list = []
+    
+    for i in range(n_options):
+        T_exp = expiries[i]
+        T_und = tenors[i]
+        
+        start_idx = torch.argmin(torch.abs(model.T - T_exp)).item()
+        end_idx = torch.argmin(torch.abs(model.T - (T_exp + T_und))).item()
+        
+        if end_idx <= start_idx:
+            alpha_smm_list.append(torch.tensor(1e-5, device=device, dtype=dtype))
+            rho_smm_list.append(torch.tensor(0.0, device=device, dtype=dtype))
+            continue
+            
+        P_I = P0[start_idx]
+        P_J = P0[end_idx]
+        A0 = torch.sum(tau[start_idx:end_idx] * P0[start_idx+1:end_idx+1])
+        S0 = (P_I - P_J) / A0
+        
+        pi_weights = torch.zeros(end_idx - start_idx, device=device, dtype=dtype)
+        for j_local in range(end_idx - start_idx):
+            j_global = start_idx + j_local
+            sum_P = torch.sum(tau[j_global:end_idx] * P0[j_global+1:end_idx+1])
+            Pi_j = (tau[j_global] * P0[j_global+1]) / (A0 * P0[j_global]) * (P_J + S0 * sum_P)
+            pi_weights[j_local] = Pi_j * alpha_normal[j_global]
+            
+        Sigma_slice = Sigma_matrix[start_idx:end_idx, start_idx:end_idx]
+        v_0 = torch.matmul(pi_weights.unsqueeze(0), torch.matmul(Sigma_slice, pi_weights.unsqueeze(1))).squeeze()
+        
+        a_smm = torch.sqrt(torch.clamp(v_0, min=1e-14))
+        alpha_smm_list.append(a_smm)
+        
+        rho_slice = model.rhos[start_idx:end_idx]
+        rho_mapped = torch.sum(rho_slice * pi_weights) / a_smm
+        rho_smm_list.append(torch.clamp(rho_mapped, -0.999, 0.999))
+
+    # Convert accumulated lists back to stacked tensors for vectorized math
+    alpha_smm = torch.stack(alpha_smm_list)
+    rho_smm = torch.stack(rho_smm_list)
+    
+    # 2. Evaluate Pure PyTorch ODE (Fukasawa-Gatheral Expansion)
+    k_t = torch.tensor(strike_offsets, device=device, dtype=dtype)
+    T_t = torch.tensor(expiries, device=device, dtype=dtype)
+    nu = model.nus[0]
+    H = model.H
+    
+    y = (nu * (T_t**(H - 0.5)) * k_t) / alpha_smm
+    
+    def G_half(z, r):
+        inner = torch.sqrt(1.0 + r * z + z**2 / 4.0) - r - z / 2.0
+        return 4.0 * (torch.log(inner / (1.0 - r)))**2
+        
+    def G_zero(z, r):
+        term1 = torch.log(1.0 + 2.0 * r * z + z**2)
+        denom = torch.sqrt(1.0 - r**2)
+        term2 = (2.0 * r / denom) * (torch.atan(r / denom) - torch.atan((z + r) / denom))
+        return term1 + term2
+
+    safe_y = torch.where(torch.abs(y) < 1e-12, torch.tensor(1e-12, dtype=dtype, device=device), y)
+    z0 = safe_y / (2.0 * H + 1.0)
+    z_half = 2.0 * safe_y / (2.0 * H + 1.0)
+    
+    w0 = 3.0 * (1.0 - 2.0 * H) / (2.0 * H + 3.0)
+    w_half = 2.0 * H / (2.0 * H + 3.0)
+    
+    G_A = ((2.0 * H + 1.0)**2) * (w0 * G_zero(z0, rho_smm) + w_half * G_half(z_half, rho_smm))
+    G_A_safe = torch.clamp(G_A, min=1e-14)
+    
+    ratio = torch.where(torch.abs(y) < 1e-12, torch.tensor(1.0, dtype=dtype, device=device), torch.abs(safe_y) / torch.sqrt(G_A_safe))
+    
+    # Return Implied Volatility (in absolute terms)
+    return alpha_smm * ratio
+
+

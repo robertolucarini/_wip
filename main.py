@@ -13,7 +13,7 @@ from src.pricers import torch_bermudan_pricer, torch_bachelier
 from config import CHECK_MC, CHECK_DRIFT
 import pandas as pd
 from src.calibration import CorrelationCalibrator
-from config import CALI_MODE, CORR_MODE, BETA_SABR, SHIFT_SABR, CHECK_LIMIT
+from config import CALI_MODE, CORR_MODE, BETA_SABR, SHIFT_SABR, CHECK_LIMIT, H_GRID
 
 
 def load_atm_matrix(csv_path):
@@ -52,7 +52,7 @@ if __name__ == "__main__":
     
     # Run the fast ODE grid search to find the global Hurst (H) and Nu
     calibrator = RoughSABRCalibrator(vol_matrix_1y)
-    calib = calibrator.calibrate(method=CALI_MODE)
+    calib = calibrator.calibrate(method=CALI_MODE, H_grid=H_GRID)
 
     print_summary_table("ROUGH SABR 1D CALIBRATION", {
         "Global Hurst (H)": calib['H'],
@@ -274,3 +274,43 @@ if __name__ == "__main__":
         strike_bps = test_K[i] * 10000
         print(f"{strike_bps:>12.0f} | {vol_poly[i]*10000:>13.2f} | {vol_ode[i]*10000:>12.2f} | {vol_mc[i]*10000:>11.2f}")
     print("=" * 60)
+
+
+    # # ============================================================
+    # #       SUB-STEP 2.1 DIAGNOSTIC: ODE SURROGATE CHECK
+    # # ============================================================
+    # from src.pricers import mapped_smm_pricer, mapped_smm_ode
+    # import time
+    
+    # print("\n" + "="*60)
+    # print(f"{'MATRIX AMMO SURROGATE TEST (MC vs ODE)':^60}")
+    # print("="*60)
+    
+    # # Create a test batch of swaptions (e.g., 5Y expiry, Tenors 1Y to 10Y)
+    # test_expiries = np.full(10, 5.0)
+    # test_tenors = np.linspace(1.0, 10.0, 10)
+    # test_strikes = np.zeros(10) # ATM
+    
+    # # Reconstruct the Sigma matrix from the PCA loadings!
+    # test_Sigma = torch.matmul(model.loadings, model.loadings.T)
+    
+    # # 1. High-Fidelity Test (Monte Carlo)
+    # t0 = time.time()
+    # v_mc = mapped_smm_pricer(model, test_Sigma, test_expiries, test_tenors, test_strikes, n_paths=4096)
+    # time_mc = time.time() - t0
+    
+    # # 2. Low-Fidelity Test (Analytical ODE)
+    # t0 = time.time()
+    # v_ode = mapped_smm_ode(model, test_Sigma, test_expiries, test_tenors, test_strikes)
+    # time_ode = time.time() - t0
+    # v_ode_np = v_ode.detach().cpu().numpy()
+    
+    # print(f"High-Fidelity MC Time  : {time_mc:.4f} seconds")
+    # print(f"Low-Fidelity ODE Time  : {time_ode:.4f} seconds")
+    # print(f"Speedup Multiplier     : {time_mc / max(time_ode, 1e-6):,.0f}x faster")
+    # print("-" * 60)
+    # print(f"{'Tenor':>5} | {'MC Vol (bps)':>15} | {'ODE Vol (bps)':>15} | {'Gap (bps)':>10}")
+    # print("-" * 60)
+    # for i in range(10):
+    #     print(f"{test_tenors[i]:5.1f} | {v_mc[i]*10000:>15.2f} | {v_ode_np[i]*10000:>15.2f} | {(v_mc[i] - v_ode_np[i])*10000:>10.2f}")
+    # print("="*60)

@@ -509,20 +509,18 @@ class RoughSABRCalibrator:
         return jac.detach().cpu().numpy()
     
 
-
-
 class CorrelationCalibrator:
     def __init__(self, atm_vol_matrix, model):
         """
-        Stage 2 Calibrator (Adachi et al. 2025): Fits the N x N spatial correlation matrix
-        incrementally (row-by-row) using co-terminal swaptions.
+        Matrix AMMO Calibrator (Stage 2): Fits the N x N spatial correlation matrix
+        using a Low-Fidelity ODE Surrogate with exact PyTorch Autograd Jacobians.
         """
         self.model = model
         self.device = model.device
         self.N = model.N
         self.grid_T = model.T.cpu().numpy()
         
-        # Flatten the ATM matrix for easy filtering
+        # Flatten the ATM matrix
         expiries, tenors, vols = [], [], []
         for exp in atm_vol_matrix.index:
             for ten in atm_vol_matrix.columns:
@@ -539,36 +537,18 @@ class CorrelationCalibrator:
         # Initialize Rapisarda angles matrix (N x N)
         self.omega = np.zeros((self.N, self.N))
         
-        # Base constraints from Adachi 2025: d<W1, W2> = dt
-        # For our 0-indexed forward rate matrix, this anchors the first two dimensions
         if self.N > 1:
             self.omega[1, 0] = 0.0 # cos(0) = 1.0 (Perfect correlation)
         if self.N > 2:
             self.omega[2:, 1] = np.pi / 2.0 # cos(pi/2) = 0.0 (Orthogonal)
-   
-         
-    def _obj_row(self, p, row_idx, free_indices, exp_targets, ten_targets, vol_targets):
-        with torch.no_grad(): # <-- Disable Autograd for SciPy loop
-            # Update the free angles for this specific row
-            self.omega[row_idx, free_indices] = p
+      
             
-            # Build the exact correlation matrix
-            omega_tensor = torch.tensor(self.omega, device=self.device, dtype=self.model.dtype)
-            Sigma_matrix = build_rapisarda_correlation_matrix(omega_tensor)
-            
-            # Price the target swaptions using the ultra-fast Mapped SMM
-            strikes = np.zeros_like(exp_targets) # ATM = 0.0 offset
-            model_vols = mapped_smm_pricer(
-                self.model, Sigma_matrix, exp_targets, ten_targets, strikes, 
-                dt=1.0/24.0, n_paths=4096
-            )
-            
-            return (model_vols - vol_targets) * 10000.0
-
-
     def calibrate(self):
+        import time
+        from src.pricers import mapped_smm_pricer, mapped_smm_ode
+        
         print("\n" + "="*60)
-        print(f"{'SPATIAL CORRELATION CALIBRATION (NxN INCREMENTAL)':^60}")
+        print(f"{'SPATIAL CORRELATION CALIBRATION (MATRIX AMMO)':^60}")
         print("="*60)
         
         start_time = time.time()
@@ -576,53 +556,94 @@ class CorrelationCalibrator:
         # Loop through each row of the correlation matrix incrementally
         for i in range(2, self.N):
             row_start_time = time.time()
-            # The forward rate R^i ends at T_{i+1}. We target swaptions co-terminal to this.
             target_maturity = self.grid_T[i+1] 
             
-            # Find co-terminal swaptions: Expiry + Tenor == target_maturity
             mask = np.abs((self.expiries + self.tenors) - target_maturity) < 1e-4
-            
             exp_targets = self.expiries[mask]
             ten_targets = self.tenors[mask]
             vol_targets = self.market_vols[mask]
             
-            # -- LOGGING: Start of row processing --
             print(f"Row {i:2d}/{self.N-1} | Target Maturity: {target_maturity:4.1f}Y | ", end="")
             
             if len(exp_targets) == 0:
-                print("Skipped (No co-terminal swaptions found in market data)")
+                print("Skipped (No co-terminal swaptions found)")
                 continue
                 
-            # Determine free indices for this row.
-            # Adachi rule: omega[i, 1] is fixed to pi/2 for i >= 2.
-            # So the free angle indices are 0 and 2...i-1
             free_indices = [0] + list(range(2, i))
-            
             if not free_indices:
-                print("Skipped (No free correlation angles to optimize)")
+                print("Skipped (No free correlation angles)")
                 continue
                 
-            # -- LOGGING: Pre-optimization details --
             print(f"Matched {len(exp_targets):2d} swaptions | Optimizing {len(free_indices):2d} angles... ", end="", flush=True)
                 
-            # Initial guess: angles = pi/4 (moderate positive correlation)
-            guess = np.full(len(free_indices), np.pi / 4.0)
             bounds = (0.0, np.pi) 
+            current_p = np.full(len(free_indices), np.pi / 4.0)
+            strikes = np.zeros_like(exp_targets)
             
-            # Run the optimizer for this specific row
-            res = least_squares(
-                self._obj_row, guess, 
-                args=(i, free_indices, exp_targets, ten_targets, vol_targets),
-                bounds=bounds, method='trf', ftol=1e-5, xtol=1e-5
-            )
+            best_mc_rmse = np.inf
+            best_p = current_p.copy()
             
-            # Lock in the optimized angles for this row
-            self.omega[i, free_indices] = res.x
+            # --- AMMO OUTER LOOP (Recourse to High-Fidelity) ---
+            # 2 iterations are sufficient to perfectly lock the gap
+            for ammo_iter in range(2):
+                
+                # 1. Update Matrix with current guess
+                self.omega[i, free_indices] = current_p
+                omega_tensor = torch.tensor(self.omega, device=self.device, dtype=self.model.dtype)
+                Sigma_matrix = build_rapisarda_correlation_matrix(omega_tensor)
+                
+                # 2. Evaluate High-Fidelity (MC) and Low-Fidelity (ODE) EXACTLY ONCE
+                v_mc = mapped_smm_pricer(self.model, Sigma_matrix, exp_targets, ten_targets, strikes, dt=1.0/24.0, n_paths=4096)
+                v_ode = mapped_smm_ode(self.model, Sigma_matrix, exp_targets, ten_targets, strikes)
+                v_ode_np = v_ode.detach().cpu().numpy()
+                
+                # Check Absolute Convergence
+                mc_rmse = np.sqrt(np.mean(((v_mc - vol_targets)*10000.0)**2))
+                if mc_rmse < best_mc_rmse:
+                    best_mc_rmse = mc_rmse
+                    best_p = current_p.copy()
+                    
+                # 3. Establish the Additive Defect Gap (Zero-Order Consistency)
+                delta_k = v_mc - v_ode_np
+                
+                # 4. Define the Ultra-Fast Surrogate Objective
+                def ammo_surrogate(p_inner):
+                    self.omega[i, free_indices] = p_inner
+                    o_t = torch.tensor(self.omega, device=self.device, dtype=self.model.dtype)
+                    S_mat = build_rapisarda_correlation_matrix(o_t)
+                    v_surr = mapped_smm_ode(self.model, S_mat, exp_targets, ten_targets, strikes)
+                    return (v_surr.detach().cpu().numpy() + delta_k - vol_targets) * 10000.0
+                    
+                # 5. Define the PyTorch Analytical Jacobian (First-Order Consistency)
+                def ammo_jacobian(p_inner):
+                    def _diff_obj(p_tensor):
+                        # Safely reconstruct omega tensor for Autograd tracking
+                        o_mod = torch.tensor(self.omega, device=self.device, dtype=self.model.dtype).clone()
+                        o_mod[i, free_indices] = p_tensor  # Inject differentiable variables
+                        
+                        S_mat = build_rapisarda_correlation_matrix(o_mod)
+                        v_surr = mapped_smm_ode(self.model, S_mat, exp_targets, ten_targets, strikes)
+                        
+                        # Add constant defect gap and compare to target
+                        return (v_surr + torch.tensor(delta_k, device=self.device) - torch.tensor(vol_targets, device=self.device)) * 10000.0
+                        
+                    p_t = torch.tensor(p_inner, device=self.device, dtype=self.model.dtype, requires_grad=True)
+                    jac = torch.autograd.functional.jacobian(_diff_obj, p_t)
+                    return jac.detach().cpu().numpy()
+
+                # 6. Inner Optimization (SciPy only interacts with the fast ODE Surrogate)
+                res = least_squares(
+                    ammo_surrogate, current_p, bounds=bounds, 
+                    jac=ammo_jacobian, method='trf', 
+                    ftol=1e-5, xtol=1e-5, max_nfev=25
+                )
+                current_p = res.x
+                
+            # Lock in the best verified angles
+            self.omega[i, free_indices] = best_p
             
-            # -- LOGGING: Post-optimization results --
-            rmse = np.sqrt(np.mean(res.fun**2))
             row_time = time.time() - row_start_time
-            print(f"Done! RMSE: {rmse:5.2f} bps | Time: {row_time:4.2f}s")
+            print(f"Done! RMSE: {best_mc_rmse:5.2f} bps | Time: {row_time:4.2f}s")
         
         # Finalize the Sigma Matrix
         omega_tensor = torch.tensor(self.omega, device=self.device, dtype=self.model.dtype)
@@ -630,10 +651,11 @@ class CorrelationCalibrator:
         
         end_time = time.time()
         print("\nStatus : SUCCESS")
-        print(f"NxN Calibration Total Time: {end_time - start_time:.2f}s")
+        print(f"NxN Matrix AMMO Total Time: {end_time - start_time:.2f}s")
         print("="*60 + "\n")
         
         return {
             'omega_matrix': self.omega,
             'Sigma_matrix': Sigma_final.cpu().numpy()
         }
+    
