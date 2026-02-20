@@ -5,6 +5,11 @@ import torch
 from torch.distributions import Normal
 import math
 from scipy.stats import norm
+from src.utils import build_rapisarda_correlation_matrix
+from src.pricers import mapped_smm_pricer
+import time
+import pandas as pd
+
 
 
 def mc_rough_bergomi_pricer(K_flat, T_flat, alpha_flat, rho_flat, nu, H, n_paths=(32768/2), dt=1.0/50.0, kappa_hybrid=1, device='cpu'):
@@ -163,6 +168,13 @@ class RoughSABRCalibrator:
         self.T_flat = self.T_flat[valid]
         self.K_flat = self.K_flat[valid]
 
+        # --- NEW AMMO CODE: Pre-computations for the PyTorch Jacobian ---
+        # Map each point in the flattened grid directly to its expiry index
+        self.t_indices = torch.tensor([np.where(self.expiries == t)[0][0] for t in self.T_flat], dtype=torch.long)
+        self.K_flat_t = torch.tensor(self.K_flat, dtype=torch.float64)
+        self.T_flat_t = torch.tensor(self.T_flat, dtype=torch.float64)
+        self.alpha_flat_t = torch.tensor(self.alpha_ts(self.T_flat), dtype=torch.float64)
+
 
     def rough_sabr_vol(self, k, T, alpha, rho, nu, H):
         """ Core Rough SABR asymptotic expansion formula """
@@ -258,50 +270,126 @@ class RoughSABRCalibrator:
 
 
     def calibrate(self, method='MC', H_grid=np.array([0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50])):
+        import time
         print("\n" + "="*60)
-        print(f"{f'ROUGH SABR CALIBRATION (GLOBAL NU | {method.upper()})':^60}")
+        print(f"{f'ROUGH SABR 1D CALIBRATION (GLOBAL NU | {method.upper()})':^60}")
         print("="*60)
         
         best_rmse = np.inf
         best_H = None
-        best_res = None
+        best_res_x = None
         
-        # Initial guess: [Rhos, Nu_global]
+        # Identify ATM points to apply the Alexandrov Beta-Correction
+        atm_idx = np.argmin(np.abs(self.strike_offsets))
+        atm_val_strike = self.strike_offsets[atm_idx]
+        base_market_alphas = self.vol_matrix.iloc[:, atm_idx].values.copy()
+        
         guess = np.concatenate([np.full(self.n_exp, -0.1), [0.4]])
         low_bounds = np.concatenate([np.full(self.n_exp, -0.99), [0.001]])
         high_bounds = np.concatenate([np.full(self.n_exp, 0.99), [5.0]])
         
-        # Discrete Grid Search over Hurst exponent
-        for H in H_grid:
-            res = least_squares(
-                self._obj, guess, args=(H, method),
-                bounds=(low_bounds, high_bounds), 
-                ftol=1e-10, xtol=1e-10
-            )
-            rmse = np.sqrt(np.mean(res.fun**2))
+        start_time_total = time.time()
+        
+        for i, H in enumerate(H_grid):
+            step_start_time = time.time()
+            print(f"Grid {i+1:2d}/{len(H_grid)} | Testing Hurst (H) = {H:.3f} | ", end="", flush=True)
+            
+            if method == 'ODE':
+                self.alpha_ts = PchipInterpolator(self.expiries, base_market_alphas, extrapolate=True)
+                res = least_squares(self._obj, guess, args=(H, 'ODE'), bounds=(low_bounds, high_bounds), method='trf')
+                rmse = np.sqrt(np.mean(res.fun**2))
+                current_p = res.x
+                final_alphas = base_market_alphas
+            
+            elif method == 'MC':
+                # --- TRUE ALEXANDROV (2001) BETA-CORRECTION (OUTER LOOP) ---
+                current_alpha_vals = base_market_alphas.copy()
+                current_p = guess.copy()
+                
+                best_mc_rmse = np.inf
+                best_mc_p = current_p.copy()
+                best_grid_alphas = current_alpha_vals.copy()
+                
+                # Outer AMMO loop: Decouples MC from the SciPy line search
+                for ammo_iter in range(3):
+                    # 1. Update the ODE's alpha term structure
+                    self.alpha_ts = PchipInterpolator(self.expiries, current_alpha_vals, extrapolate=True)
+                    
+                    # 2. Fast Low-Fidelity Optimization (SciPy only sees the clean ODE)
+                    res_ode = least_squares(
+                        self._obj, current_p, args=(H, 'ODE'), 
+                        bounds=(low_bounds, high_bounds), method='trf'
+                    )
+                    current_p = res_ode.x
+                    
+                    # 3. High-Fidelity Evaluation (MC) at the new optimal point
+                    rhos = current_p[:self.n_exp]
+                    nu_val = current_p[-1]
+                    r_ts = PchipInterpolator(self.expiries, rhos, extrapolate=True)
+                    
+                    v_mc = self.rough_sabr_vol_mc(
+                        self.K_flat, self.T_flat, self.alpha_ts(self.T_flat), 
+                        r_ts(self.T_flat), nu_val, H
+                    )
+                    v_ode = self.rough_sabr_vol_ode(
+                        self.K_flat, self.T_flat, self.alpha_ts(self.T_flat), 
+                        r_ts(self.T_flat), nu_val, H
+                    )
+                    
+                    # 4. Measure True RMSE against the Market
+                    mc_rmse = np.sqrt(np.mean(((v_mc - self.market_vols)*10000.0)**2))
+                    
+                    if mc_rmse < best_mc_rmse:
+                        best_mc_rmse = mc_rmse
+                        best_mc_p = current_p.copy()
+                        best_grid_alphas = current_alpha_vals.copy()
+                        
+                    # 5. Alexandrov's Beta-Correction for the constrained alpha parameter
+                    # beta = phi_hi / phi_lo. We scale the input alpha inversely by the ATM beta
+                    # so the next ODE step perfectly absorbs the MC convexity premium.
+                    beta_ratio = v_mc / np.maximum(v_ode, 1e-8)
+                    
+                    for exp_idx, exp_t in enumerate(self.expiries):
+                        idx_mask = (np.abs(self.T_flat - exp_t) < 1e-6) & (np.abs(self.K_flat - atm_val_strike) < 1e-6)
+                        if np.any(idx_mask):
+                            idx = np.where(idx_mask)[0][0]
+                            beta_atm = beta_ratio[idx]
+                            market_atm = self.market_vols[idx]
+                            # Correct the alpha input
+                            current_alpha_vals[exp_idx] = market_atm / beta_atm
+                            
+                rmse = best_mc_rmse
+                current_p = best_mc_p
+                final_alphas = best_grid_alphas
+
+            step_time = time.time() - step_start_time
+            print(f"Done! RMSE: {rmse:6.2f} bps | Time: {step_time:5.2f}s")
             
             if rmse < best_rmse:
                 best_rmse = rmse
                 best_H = H
-                best_res = res
+                best_res_x = current_p
+                self.best_final_alpha_ts = PchipInterpolator(self.expiries, final_alphas, extrapolate=True)
                 
-        print(f"Status : SUCCESS")
+        total_time = time.time() - start_time_total
+        print(f"\nStatus : SUCCESS")
         print(f"Global Hurst (H): {best_H:.6f}")
-        print(f"Global Nu       : {best_res.x[-1]:.4f}")
-        print(f"RMSE            : {best_rmse:.4f} bps")
+        print(f"Global Nu       : {best_res_x[-1]:.4f}")
+        print(f"Best RMSE       : {best_rmse:.4f} bps")
+        print(f"1D Calibration Total Time: {total_time:.2f}s")
+        print("="*60)
         
-        best_rhos = best_res.x[:self.n_exp]
-        best_nu = best_res.x[-1]
+        best_rhos = best_res_x[:self.n_exp]
+        best_nu = best_res_x[-1]
         
         return {
-            'alpha_func': self.alpha_ts, 
+            'alpha_func': self.best_final_alpha_ts, 
             'H': best_H, 
             'rmse_bps': best_rmse,
             'rho_func': PchipInterpolator(self.expiries, best_rhos, extrapolate=True),
-            # Returning constant interpolator for nu to keep downstream FMM compatibility 
             'nu_func': PchipInterpolator(self.expiries, np.full(self.n_exp, best_nu), extrapolate=True)
         }
-    
+        
 
     def rough_sabr_vol_mc(self, k, T, alpha, rho, nu, H):
         """ 
@@ -332,12 +420,67 @@ class RoughSABRCalibrator:
         
         return ivs
     
+    
+    def rough_sabr_vol_ode_torch(self, k, T, alpha, rho, nu, H):
+        """ Pure PyTorch version of the ODE solution for AMMO Autograd """
+        y = (nu * (T**(H - 0.5)) * k) / alpha
+        rho_safe = torch.clamp(rho, -0.9999, 0.9999)
+        
+        def G_half(z):
+            inner = torch.sqrt(1.0 + rho_safe * z + z**2 / 4.0) - rho_safe - z / 2.0
+            return 4.0 * (torch.log(inner / (1.0 - rho_safe)))**2
+            
+        def G_zero(z):
+            term1 = torch.log(1.0 + 2.0 * rho_safe * z + z**2)
+            denom = torch.sqrt(1.0 - rho_safe**2)
+            term2 = (2.0 * rho_safe / denom) * (torch.atan(rho_safe / denom) - torch.atan((z + rho_safe) / denom))
+            return term1 + term2
 
-from scipy.optimize import least_squares
-from src.utils import build_rapisarda_correlation_matrix
-from src.pricers import mapped_smm_pricer
-import time
-import pandas as pd
+        safe_y = torch.where(torch.abs(y) < 1e-12, torch.tensor(1e-12, dtype=y.dtype, device=y.device), y)
+        
+        z0 = safe_y / (2.0 * H + 1.0)
+        z_half = 2.0 * safe_y / (2.0 * H + 1.0)
+        
+        w0 = 3.0 * (1.0 - 2.0 * H) / (2.0 * H + 3.0)
+        w_half = 2.0 * H / (2.0 * H + 3.0)
+        
+        G_A = ((2.0 * H + 1.0)**2) * (w0 * G_zero(z0) + w_half * G_half(z_half))
+        G_A_safe = torch.clamp(G_A, min=1e-14)
+        
+        ratio = torch.where(torch.abs(y) < 1e-12, torch.tensor(1.0, dtype=y.dtype, device=y.device), torch.abs(safe_y) / torch.sqrt(G_A_safe))
+        
+        return alpha * ratio
+    
+
+    def _get_ammo_jacobian(self, p, H, method):
+        """
+        The AMMO Surrogate Jacobian.
+        Returns the exact analytical gradients of the Low-Fidelity ODE proxy 
+        to guide the High-Fidelity MC optimizer.
+        """
+        if method != 'MC':
+            return '2-point' # Fallback to finite differences for analytical methods
+
+        def _surrogate_obj(p_tensor):
+            rhos = p_tensor[:self.n_exp]
+            nu_val = p_tensor[-1]
+            # Map the rhos exactly to the flattened grid without heavy interpolators
+            rho_mapped = rhos[self.t_indices]
+            
+            v_ode = self.rough_sabr_vol_ode_torch(
+                self.K_flat_t, self.T_flat_t, self.alpha_flat_t, 
+                rho_mapped, nu_val, H
+            )
+            return (v_ode - torch.tensor(self.market_vols, dtype=torch.float64)) * 10000.0
+
+        # Compute exact Jacobian over all parameters simultaneously
+        p_t = torch.tensor(p, dtype=torch.float64, requires_grad=True)
+        jac = torch.autograd.functional.jacobian(_surrogate_obj, p_t)
+        
+        return jac.detach().cpu().numpy()
+    
+
+
 
 class CorrelationCalibrator:
     def __init__(self, atm_vol_matrix, model):
