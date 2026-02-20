@@ -278,12 +278,14 @@ class RoughSABRCalibrator:
         best_rmse = np.inf
         best_H = None
         best_res_x = None
+        best_alpha_vals = None
         
-        # Identify ATM points to apply the Alexandrov Beta-Correction
+        # 1. Isolate ATM market data for exact explicit matching
         atm_idx = np.argmin(np.abs(self.strike_offsets))
         atm_val_strike = self.strike_offsets[atm_idx]
         base_market_alphas = self.vol_matrix.iloc[:, atm_idx].values.copy()
         
+        # 2. REDUCED PARAMETER SPACE: ONLY [rhos (n_exp), nu_global (1)]
         guess = np.concatenate([np.full(self.n_exp, -0.1), [0.4]])
         low_bounds = np.concatenate([np.full(self.n_exp, -0.99), [0.001]])
         high_bounds = np.concatenate([np.full(self.n_exp, 0.99), [5.0]])
@@ -294,73 +296,82 @@ class RoughSABRCalibrator:
             step_start_time = time.time()
             print(f"Grid {i+1:2d}/{len(H_grid)} | Testing Hurst (H) = {H:.3f} | ", end="", flush=True)
             
+            # Fast ODE Helper (alphas are now passed externally)
+            def run_ode(alphas_in, rhos_in, nu_in):
+                a_ts = PchipInterpolator(self.expiries, alphas_in, extrapolate=True)
+                r_ts = PchipInterpolator(self.expiries, rhos_in, extrapolate=True)
+                return self.rough_sabr_vol_ode(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), nu_in, H)
+
             if method == 'ODE':
-                self.alpha_ts = PchipInterpolator(self.expiries, base_market_alphas, extrapolate=True)
-                res = least_squares(self._obj, guess, args=(H, 'ODE'), bounds=(low_bounds, high_bounds), method='trf')
+                # For pure ODE, alpha IS the market ATM
+                current_alphas = base_market_alphas.copy()
+                def obj_ode(p): 
+                    return (run_ode(current_alphas, p[:-1], p[-1]) - self.market_vols) * 10000.0
+                res = least_squares(obj_ode, guess, bounds=(low_bounds, high_bounds), method='trf')
                 rmse = np.sqrt(np.mean(res.fun**2))
                 current_p = res.x
-                final_alphas = base_market_alphas
+                final_alphas = current_alphas
             
             elif method == 'MC':
-                # --- TRUE ALEXANDROV (2001) BETA-CORRECTION (OUTER LOOP) ---
-                current_alpha_vals = base_market_alphas.copy()
-                current_p = guess.copy()
+                # A. Base Predictor: Pre-optimize ODE to get excellent starting rhos and nu
+                current_alphas = base_market_alphas.copy()
+                def obj_ode(p): 
+                    return (run_ode(current_alphas, p[:-1], p[-1]) - self.market_vols) * 10000.0
+                res_ode = least_squares(obj_ode, guess, bounds=(low_bounds, high_bounds), method='trf')
+                current_p = res_ode.x
                 
                 best_mc_rmse = np.inf
                 best_mc_p = current_p.copy()
-                best_grid_alphas = current_alpha_vals.copy()
+                best_mc_alphas = current_alphas.copy()
                 
-                # Outer AMMO loop: Decouples MC from the SciPy line search
+                # B. AMMO Outer Loop (Option 1: Implicit Alpha)
                 for ammo_iter in range(3):
-                    # 1. Update the ODE's alpha term structure
-                    self.alpha_ts = PchipInterpolator(self.expiries, current_alpha_vals, extrapolate=True)
-                    
-                    # 2. Fast Low-Fidelity Optimization (SciPy only sees the clean ODE)
-                    res_ode = least_squares(
-                        self._obj, current_p, args=(H, 'ODE'), 
-                        bounds=(low_bounds, high_bounds), method='trf'
-                    )
-                    current_p = res_ode.x
-                    
-                    # 3. High-Fidelity Evaluation (MC) at the new optimal point
-                    rhos = current_p[:self.n_exp]
+                    rhos = current_p[:-1]
                     nu_val = current_p[-1]
+                    
+                    # Evaluate High-Fidelity (MC) and Low-Fidelity (ODE) at current state
+                    a_ts = PchipInterpolator(self.expiries, current_alphas, extrapolate=True)
                     r_ts = PchipInterpolator(self.expiries, rhos, extrapolate=True)
                     
-                    v_mc = self.rough_sabr_vol_mc(
-                        self.K_flat, self.T_flat, self.alpha_ts(self.T_flat), 
-                        r_ts(self.T_flat), nu_val, H
-                    )
-                    v_ode = self.rough_sabr_vol_ode(
-                        self.K_flat, self.T_flat, self.alpha_ts(self.T_flat), 
-                        r_ts(self.T_flat), nu_val, H
-                    )
+                    v_mc = self.rough_sabr_vol_mc(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), nu_val, H)
+                    v_ode = run_ode(current_alphas, rhos, nu_val)
                     
-                    # 4. Measure True RMSE against the Market
+                    # Record True Accuracy against the raw market
                     mc_rmse = np.sqrt(np.mean(((v_mc - self.market_vols)*10000.0)**2))
-                    
                     if mc_rmse < best_mc_rmse:
                         best_mc_rmse = mc_rmse
                         best_mc_p = current_p.copy()
-                        best_grid_alphas = current_alpha_vals.copy()
+                        best_mc_alphas = current_alphas.copy()
                         
-                    # 5. Alexandrov's Beta-Correction for the constrained alpha parameter
-                    # beta = phi_hi / phi_lo. We scale the input alpha inversely by the ATM beta
-                    # so the next ODE step perfectly absorbs the MC convexity premium.
-                    beta_ratio = v_mc / np.maximum(v_ode, 1e-8)
+                    # Calculate the exact AMMO convexity defect
+                    delta_k = v_mc - v_ode
                     
+                    # IMPLICIT ALPHA UPDATE: 
+                    # Shift alphas perfectly by the ATM defect so Surrogate(ATM) = Market_ATM exactly
+                    atm_defects = np.zeros(self.n_exp)
                     for exp_idx, exp_t in enumerate(self.expiries):
                         idx_mask = (np.abs(self.T_flat - exp_t) < 1e-6) & (np.abs(self.K_flat - atm_val_strike) < 1e-6)
                         if np.any(idx_mask):
                             idx = np.where(idx_mask)[0][0]
-                            beta_atm = beta_ratio[idx]
-                            market_atm = self.market_vols[idx]
-                            # Correct the alpha input
-                            current_alpha_vals[exp_idx] = market_atm / beta_atm
+                            atm_defects[exp_idx] = delta_k[idx]
                             
+                    # The new locked alphas for the inner loop
+                    current_alphas = base_market_alphas - atm_defects
+                    
+                    # C. Inner Surrogate Optimization (Alphas are mathematically FIXED!)
+                    def ammo_surrogate(p_inner):
+                        # p_inner only contains [rhos, nu], so dimensionality is low and fast
+                        v_surr = run_ode(current_alphas, p_inner[:-1], p_inner[-1]) + delta_k
+                        return (v_surr - self.market_vols) * 10000.0
+
+                    res_surr = least_squares(
+                        ammo_surrogate, current_p, bounds=(low_bounds, high_bounds), method='trf'
+                    )
+                    current_p = res_surr.x
+                
                 rmse = best_mc_rmse
                 current_p = best_mc_p
-                final_alphas = best_grid_alphas
+                final_alphas = best_mc_alphas
 
             step_time = time.time() - step_start_time
             print(f"Done! RMSE: {rmse:6.2f} bps | Time: {step_time:5.2f}s")
@@ -369,7 +380,7 @@ class RoughSABRCalibrator:
                 best_rmse = rmse
                 best_H = H
                 best_res_x = current_p
-                self.best_final_alpha_ts = PchipInterpolator(self.expiries, final_alphas, extrapolate=True)
+                best_alpha_vals = final_alphas
                 
         total_time = time.time() - start_time_total
         print(f"\nStatus : SUCCESS")
@@ -379,17 +390,19 @@ class RoughSABRCalibrator:
         print(f"1D Calibration Total Time: {total_time:.2f}s")
         print("="*60)
         
-        best_rhos = best_res_x[:self.n_exp]
+        # Save finalized parameters
+        best_rhos = best_res_x[:-1]
         best_nu = best_res_x[-1]
+        self.alpha_ts = PchipInterpolator(self.expiries, best_alpha_vals, extrapolate=True)
         
         return {
-            'alpha_func': self.best_final_alpha_ts, 
+            'alpha_func': self.alpha_ts, 
             'H': best_H, 
             'rmse_bps': best_rmse,
             'rho_func': PchipInterpolator(self.expiries, best_rhos, extrapolate=True),
             'nu_func': PchipInterpolator(self.expiries, np.full(self.n_exp, best_nu), extrapolate=True)
         }
-        
+            
 
     def rough_sabr_vol_mc(self, k, T, alpha, rho, nu, H):
         """ 
