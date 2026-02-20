@@ -2,15 +2,15 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import PchipInterpolator
 import os
-
+import torch
 import numpy as np
-import pandas as pd
-from scipy.interpolate import PchipInterpolator
+
 
 def print_header(title):
     print("\n" + "="*60)
     print(f"{title:^60}")
     print("="*60)
+
 
 def log_progress(category, message, level=0):
     indent = "   " * level
@@ -19,6 +19,7 @@ def log_progress(category, message, level=0):
     else:
         print(f"{indent}[{category}] {message}")
 
+
 def print_summary_table(title, data_dict):
     print_header(title)
     for key, value in data_dict.items():
@@ -26,6 +27,7 @@ def print_summary_table(title, data_dict):
             print(f"{key:<30}: {value:.6f}")
         else:
             print(f"{key:<30}: {value}")
+
 
 def print_greek_ladder(deltas, vegas, tenors):
     print("\n" + "="*50)
@@ -40,16 +42,19 @@ def print_greek_ladder(deltas, vegas, tenors):
             print(f"{t:4.1f}Y      | {d:15.4f} | {v:15.4f}")
     print("-" * 50)
 
+
 # Standard Loading Functions
 def load_discount_curve(path):
     df = pd.read_csv(path)
     return PchipInterpolator(df.iloc[:,0], np.log(df.iloc[:,1]), extrapolate=True)
+
 
 def bootstrap_forward_rates(interp_func, grid_tau=1.0, max_t=30.0):
     grid = np.arange(0, max_t + grid_tau, grid_tau)
     dfs = np.exp(interp_func(grid))
     fwds = (dfs[:-1] / dfs[1:] - 1) / grid_tau
     return grid, fwds
+
 
 def load_swaption_vol_surface(path, tenor):
     df = pd.read_csv(path, index_col=0)
@@ -214,3 +219,50 @@ def load_swaption_vol_surface(csv_path, target_underlying_tenor):
     vol_matrix = vol_matrix.sort_index().sort_index(axis=1)
     
     return vol_matrix
+
+
+
+def build_rapisarda_correlation_matrix(omega):
+    """
+    Constructs an N x N correlation matrix from a lower-triangular matrix of angles (omega)
+    using the Rapisarda et al. (2007) hyperspherical parameterization.
+    
+    Fully vectorized in PyTorch for maximum GPU/CPU throughput.
+    
+    Args:
+        omega (torch.Tensor): A 2D tensor of shape (M, M) containing the angles omega_{i,j}.
+                              Only the strictly lower triangular part (j < i) is utilized.
+    Returns:
+        torch.Tensor: A symmetric, positive semi-definite correlation matrix of shape (M, M).
+    """
+    M = omega.shape[0]
+    device = omega.device
+    dtype = omega.dtype
+    
+    # 1. Compute Cosines and Sines
+    C = torch.cos(omega)
+    S = torch.sin(omega)
+    
+    # 2. Vectorized cumulative product of sines: prod_{k=0}^{j-1} sin(omega_{i,k})
+    # We shift S to the right by 1 column, padding the first column with 1.0 (since prod_{k=0}^{-1} = 1)
+    S_shifted = torch.cat([torch.ones(M, 1, dtype=dtype, device=device), S[:, :-1]], dim=1)
+    S_cumprod = torch.cumprod(S_shifted, dim=1)
+    
+    # 3. Construct the Lower Triangular Matrix B
+    # B_{i,j} = cos(omega_{i,j}) * S_cumprod_{i,j} for j < i
+    # B_{i,i} = S_cumprod_{i,i}
+    # To vectorize the diagonal assignment, we force the diagonal of C to be 1.0
+    C_mod = C.clone()
+    C_mod.diagonal().fill_(1.0)
+    
+    # Multiply and isolate the lower triangle
+    B = torch.tril(C_mod * S_cumprod)
+    
+    # 4. Generate the Correlation Matrix (Sigma = B @ B^T)
+    Sigma = torch.matmul(B, B.T)
+    
+    # 5. Clean up any floating point noise at the boundaries
+    Sigma = torch.clamp(Sigma, -1.0, 1.0)
+    Sigma.diagonal().fill_(1.0)
+    
+    return Sigma

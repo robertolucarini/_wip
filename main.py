@@ -15,28 +15,75 @@ from src.torch_model import TorchRoughSABR_FMM
 from src.pricers import torch_bermudan_pricer, torch_bachelier
 from config import CHECK_MC, CHECK_DRIFT
 
+import pandas as pd
+from src.calibration import CorrelationCalibrator
+
+def load_atm_matrix(csv_path):
+    df = pd.read_csv(csv_path, sep=';')
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    
+    c_exp = next(c for c in df.columns if 'EXPIRY' in c)
+    c_ten = next(c for c in df.columns if 'UNDERLYING' in c or 'TENOR' in c)
+    c_str = next(c for c in df.columns if 'STRIKE' in c)
+    c_val = next(c for c in df.columns if 'VOL' in c or 'VALUE' in c)
+    
+    # 1. Filter for strictly ATM strings
+    df = df[df[c_str].astype(str).str.strip().str.upper() == 'ATM'].copy()
+    
+    # 2. Parse Tenors (Months to Years, Years to float)
+    def parse_tenor(x):
+        x = str(x).strip().upper()
+        if 'M' in x: return float(x.replace('M', '')) / 12.0
+        if 'Y' in x: return float(x.replace('Y', ''))
+        return float(x)
+        
+    df[c_exp] = df[c_exp].apply(parse_tenor)
+    df[c_ten] = df[c_ten].apply(parse_tenor)
+    
+    return df.pivot_table(values=c_val, index=c_exp, columns=c_ten, aggfunc='first')
+
+
 if __name__ == "__main__":
     t_init = time.time()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # --- 1. DATA LOADING & CALIBRATION ---
+    # --- 1. STAGE 1: 1D MARGINAL CALIBRATION ---
     ois_func = load_discount_curve("data/estr_disc.csv")
     grid_T, F0_rates = bootstrap_forward_rates(ois_func)
-    vol_matrix = load_swaption_vol_surface("data/estr_vol_full_strikes.csv", 1.0)
+    vol_matrix_1y = load_swaption_vol_surface("data/estr_vol_full_strikes.csv", 1.0)
     
-    calibrator = RoughSABRCalibrator(vol_matrix)
-    calib = calibrator.calibrate(method='ODE')
+    # Run the fast ODE grid search to find the global Hurst (H) and Nu
+    calibrator = RoughSABRCalibrator(vol_matrix_1y)
+    calib = calibrator.calibrate(method='MC')
 
-    print_summary_table("ROUGH SABR CALIBRATION", {
+    print_summary_table("ROUGH SABR 1D CALIBRATION", {
         "Global Hurst (H)": calib['H'],
         "RMSE (bps)": calib['rmse_bps'],
         "Status": "SUCCESS"
     })
 
-    # --- 2. MODEL SETUP ---
+    # --- 2. STAGE 2: SPATIAL CORRELATION CALIBRATION ---
+    # Instantiate a temporary model to pass the 1D dynamics into the calibrator
+    model_base = TorchRoughSABR_FMM(grid_T, F0_rates, calib['alpha_func'], 
+                                    calib['rho_func'], calib['nu_func'], calib['H'], 
+                                    beta_sabr=0.5, shift=0.0, correlation_mode='pca', device=device)
+    
+    # Load the full Expiry x Tenor ATM Swaption Matrix
+    atm_matrix = load_atm_matrix("data/estr_vol_full_strikes.csv")
+    
+    # Calibrate the NxN Angles row-by-row
+    corr_calibrator = CorrelationCalibrator(atm_matrix, model_base)
+    corr_res = corr_calibrator.calibrate()
+
+    # --- 3. FINAL PRODUCTION MODEL ---
+    # Instantiate the final model utilizing the full rank and the calibrated Rapisarda angles!
     model = TorchRoughSABR_FMM(grid_T, F0_rates, calib['alpha_func'], 
                                calib['rho_func'], calib['nu_func'], calib['H'], 
-                               beta_sabr=0.5, shift=0.0, device=device)
+                               beta_sabr=0.5, shift=0.0, 
+                               correlation_mode='full', omega_matrix=corr_res['omega_matrix'], 
+                               device=device)
+
+
 
     # --- 3. SIMULATION FOR DIAGNOSTICS ---
     # Common settings for diagnostic checks

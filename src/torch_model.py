@@ -1,40 +1,65 @@
 import torch
 import torch.nn as nn
 import numpy as np
+from src.utils import build_rapisarda_correlation_matrix
+
 
 class TorchRoughSABR_FMM(nn.Module):
-    def __init__(self, tenors, F0, alpha_f, rho_f, nu_f, H, beta_decay=0.05, beta_sabr=0.5, shift=0.0, n_factors=3, device='cpu'):
+    def __init__(self, tenors, F0, alpha_f, rho_f, nu_f, H, beta_decay=0.05, beta_sabr=0.5, shift=0.0, n_factors=3, correlation_mode='pca', omega_matrix=None, device='cpu'):
         super().__init__()
         self.device = device
         self.dtype = torch.float64
-        self.n_factors = n_factors
+        self.correlation_mode = correlation_mode.lower()
         
         self.register_buffer('T', torch.tensor(tenors, device=device, dtype=self.dtype))
         self.register_buffer('tau', torch.tensor(np.diff(tenors), device=device, dtype=self.dtype))
         self.N = len(F0)
         
         self.F0 = nn.Parameter(torch.tensor(F0, device=device, dtype=self.dtype))
-        self.alphas = nn.Parameter(torch.tensor(alpha_f(tenors[:-1]), device=device, dtype=self.dtype))
+        self.register_buffer('beta_sabr', torch.tensor(beta_sabr, device=device, dtype=self.dtype))
+        self.register_buffer('shift', torch.tensor(shift, device=device, dtype=self.dtype))
+
+        # CORRECT SCALING: alpha_f is the ATM Normal Volatility.
+        # SABR base alpha = NormalVol / (F0^beta)
+        base_normal_vols = torch.tensor(alpha_f(tenors[:-1]), device=device, dtype=self.dtype)
+        eta_F0 = torch.pow(torch.abs(self.F0 + self.shift), self.beta_sabr)
+        self.alphas = nn.Parameter(base_normal_vols / eta_F0)
         
         self.register_buffer('rhos', torch.tensor(rho_f(tenors[:-1]), device=device, dtype=self.dtype))
         self.register_buffer('nus', torch.tensor(nu_f(tenors[:-1]), device=device, dtype=self.dtype))
         self.register_buffer('H', torch.tensor(H, device=device, dtype=self.dtype))
-        self.register_buffer('beta_sabr', torch.tensor(beta_sabr, device=device, dtype=self.dtype))
-        self.register_buffer('shift', torch.tensor(shift, device=device, dtype=self.dtype))
 
-        # PCA Setup
-        T_mat_i, T_mat_j = self.T[:-1].unsqueeze(1), self.T[:-1].unsqueeze(0)
-        # rate-rate corr
-        spatial_corr = torch.exp(-beta_decay * torch.abs(T_mat_i - T_mat_j))
-        # eigen decomposition
-        evals, evecs = torch.linalg.eigh(spatial_corr)
-        # sort
-        idx = torch.argsort(evals, descending=True)
-        # pca loadings
-        loadings = evecs[:, idx[:n_factors]] * torch.sqrt(torch.clamp(evals[idx[:n_factors]], min=0.0)).unsqueeze(0)
+        # Spatial Correlation Matrix Setup
+        if self.correlation_mode == 'pca':
+            self.n_factors = n_factors
+            T_mat_i, T_mat_j = self.T[:-1].unsqueeze(1), self.T[:-1].unsqueeze(0)
+            spatial_corr = torch.exp(-beta_decay * torch.abs(T_mat_i - T_mat_j))
+            evals, evecs = torch.linalg.eigh(spatial_corr)
+            idx = torch.argsort(evals, descending=True)
+            loadings = evecs[:, idx[:self.n_factors]] * torch.sqrt(torch.clamp(evals[idx[:self.n_factors]], min=0.0)).unsqueeze(0)
+            
+        elif self.correlation_mode == 'full':
+            self.n_factors = self.N  # Full rank (N forward rates)
+            
+            if omega_matrix is not None:
+                # Use Adachi's Rapisarda Hyperspherical Angles
+                omega_tensor = torch.tensor(omega_matrix, device=device, dtype=self.dtype)
+                spatial_corr = build_rapisarda_correlation_matrix(omega_tensor)
+            else:
+                # Fallback to standard exponential decay if no angles provided
+                T_mat_i, T_mat_j = self.T[:-1].unsqueeze(1), self.T[:-1].unsqueeze(0)
+                spatial_corr = torch.exp(-beta_decay * torch.abs(T_mat_i - T_mat_j))
+                
+            # Add a tiny jitter to the diagonal for numerical stability of Cholesky
+            jitter = torch.eye(self.N, device=device, dtype=self.dtype) * 1e-10
+            loadings = torch.linalg.cholesky(spatial_corr + jitter)
+            
+        else:
+            raise ValueError(f"Unknown correlation_mode: {self.correlation_mode}")
 
         self.register_buffer('loadings', loadings / torch.sqrt(torch.sum(loadings**2, dim=1, keepdim=True)))
         self.register_buffer('Lambda_upper', torch.triu(self.loadings @ self.loadings.T, diagonal=1))
+
 
     def get_terminal_bond(self):
         return torch.prod(1.0 / (1.0 + self.tau * self.F0))
