@@ -302,7 +302,23 @@ class RoughSABRCalibrator:
                 r_ts = PchipInterpolator(self.expiries, rhos_in, extrapolate=True)
                 return self.rough_sabr_vol_ode(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), nu_in, H)
 
-            if method == 'ODE':
+            # Fast Polynomial Helper
+            def run_poly(alphas_in, rhos_in, nu_in):
+                a_ts = PchipInterpolator(self.expiries, alphas_in, extrapolate=True)
+                r_ts = PchipInterpolator(self.expiries, rhos_in, extrapolate=True)
+                return self.rough_sabr_vol(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), nu_in, H)
+
+            if method == 'polynomial':
+                # For pure polynomial, alpha IS the market ATM
+                current_alphas = base_market_alphas.copy()
+                def obj_poly(p): 
+                    return (run_poly(current_alphas, p[:-1], p[-1]) - self.market_vols) * 10000.0
+                res = least_squares(obj_poly, guess, bounds=(low_bounds, high_bounds), method='trf')
+                rmse = np.sqrt(np.mean(res.fun**2))
+                current_p = res.x
+                final_alphas = current_alphas
+
+            elif method == 'ODE':
                 # For pure ODE, alpha IS the market ATM
                 current_alphas = base_market_alphas.copy()
                 def obj_ode(p): 
@@ -529,7 +545,8 @@ class CorrelationCalibrator:
             self.omega[1, 0] = 0.0 # cos(0) = 1.0 (Perfect correlation)
         if self.N > 2:
             self.omega[2:, 1] = np.pi / 2.0 # cos(pi/2) = 0.0 (Orthogonal)
-            
+   
+         
     def _obj_row(self, p, row_idx, free_indices, exp_targets, ten_targets, vol_targets):
         with torch.no_grad(): # <-- Disable Autograd for SciPy loop
             # Update the free angles for this specific row
@@ -547,7 +564,8 @@ class CorrelationCalibrator:
             )
             
             return (model_vols - vol_targets) * 10000.0
-        
+
+
     def calibrate(self):
         print("\n" + "="*60)
         print(f"{'SPATIAL CORRELATION CALIBRATION (NxN INCREMENTAL)':^60}")

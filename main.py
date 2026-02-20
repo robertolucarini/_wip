@@ -3,20 +3,18 @@ import os
 import warnings
 import numpy as np
 import time
-
-# --- OPTIMIZATION & WARNING SUPPRESSION ---
 torch.set_num_threads(os.cpu_count()) 
 torch.backends.cudnn.benchmark = True
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.utils.checkpoint")
-
 from src.utils import print_summary_table, print_greek_ladder, load_discount_curve, bootstrap_forward_rates, load_swaption_vol_surface
 from src.calibration import RoughSABRCalibrator
 from src.torch_model import TorchRoughSABR_FMM
 from src.pricers import torch_bermudan_pricer, torch_bachelier
 from config import CHECK_MC, CHECK_DRIFT
-
 import pandas as pd
 from src.calibration import CorrelationCalibrator
+from config import CALI_MODE, CORR_MODE, BETA_SABR, SHIFT_SABR, CHECK_LIMIT
+
 
 def load_atm_matrix(csv_path):
     df = pd.read_csv(csv_path, sep=';')
@@ -54,7 +52,7 @@ if __name__ == "__main__":
     
     # Run the fast ODE grid search to find the global Hurst (H) and Nu
     calibrator = RoughSABRCalibrator(vol_matrix_1y)
-    calib = calibrator.calibrate(method='MC')
+    calib = calibrator.calibrate(method=CALI_MODE)
 
     print_summary_table("ROUGH SABR 1D CALIBRATION", {
         "Global Hurst (H)": calib['H'],
@@ -62,27 +60,36 @@ if __name__ == "__main__":
         "Status": "SUCCESS"
     })
 
-    # --- 2. STAGE 2: SPATIAL CORRELATION CALIBRATION ---
-    # Instantiate a temporary model to pass the 1D dynamics into the calibrator
-    model_base = TorchRoughSABR_FMM(grid_T, F0_rates, calib['alpha_func'], 
-                                    calib['rho_func'], calib['nu_func'], calib['H'], 
-                                    beta_sabr=0.5, shift=0.0, correlation_mode='pca', device=device)
-    
-    # Load the full Expiry x Tenor ATM Swaption Matrix
-    atm_matrix = load_atm_matrix("data/estr_vol_full_strikes.csv")
-    
-    # Calibrate the NxN Angles row-by-row
-    corr_calibrator = CorrelationCalibrator(atm_matrix, model_base)
-    corr_res = corr_calibrator.calibrate()
+    if CORR_MODE == 'full':
+        # --- 2. STAGE 2: SPATIAL CORRELATION CALIBRATION ---
+        # Instantiate a temporary model to pass the 1D dynamics into the calibrator
+        model_base = TorchRoughSABR_FMM(grid_T, F0_rates, calib['alpha_func'], 
+                                        calib['rho_func'], calib['nu_func'], calib['H'], 
+                                        beta_sabr=BETA_SABR, shift=SHIFT_SABR, correlation_mode=CORR_MODE, device=device)
+        
+        # Load the full Expiry x Tenor ATM Swaption Matrix
+        atm_matrix = load_atm_matrix("data/estr_vol_full_strikes.csv")
+        
+        # Calibrate the NxN Angles row-by-row
+        corr_calibrator = CorrelationCalibrator(atm_matrix, model_base)
+        corr_res = corr_calibrator.calibrate()
 
-    # --- 3. FINAL PRODUCTION MODEL ---
-    # Instantiate the final model utilizing the full rank and the calibrated Rapisarda angles!
-    model = TorchRoughSABR_FMM(grid_T, F0_rates, calib['alpha_func'], 
-                               calib['rho_func'], calib['nu_func'], calib['H'], 
-                               beta_sabr=0.5, shift=0.0, 
-                               correlation_mode='full', omega_matrix=corr_res['omega_matrix'], 
-                               device=device)
-
+        # --- 3. FINAL PRODUCTION MODEL ---
+        # Instantiate the final model utilizing the full rank and the calibrated Rapisarda angles!
+        model = TorchRoughSABR_FMM(grid_T, F0_rates, calib['alpha_func'], 
+                                   calib['rho_func'], calib['nu_func'], calib['H'], 
+                                   beta_sabr=BETA_SABR, shift=SHIFT_SABR, 
+                                   correlation_mode=CORR_MODE, omega_matrix=corr_res['omega_matrix'], 
+                                   device=device)
+    else:
+        # --- 3. FINAL PRODUCTION MODEL (PCA Fast-Path) ---
+        print("\nSkipping NxN Calibration (PCA Mode Selected)...")
+        model = TorchRoughSABR_FMM(grid_T, F0_rates, calib['alpha_func'], 
+                                   calib['rho_func'], calib['nu_func'], calib['H'], 
+                                   beta_sabr=BETA_SABR, shift=SHIFT_SABR, 
+                                   correlation_mode=CORR_MODE, 
+                                   device=device)
+        
 
 
     # --- 3. SIMULATION FOR DIAGNOSTICS ---
@@ -103,6 +110,7 @@ if __name__ == "__main__":
             # Generate frozen paths once for use in both Drift and MC validation
             F_paths_frozen = model.simulate_forward_curve(n_paths_test, time_grid, freeze_drift=True)
             time_frozen = time.time() - t0_frozen
+
 
     # --- 3a. DRIFT COMPARISON: FROZEN VS EXACT ---
     if CHECK_DRIFT:
@@ -129,9 +137,11 @@ if __name__ == "__main__":
             "Exact Mean (bps)": mean_fwd_unfrozen * 10000,
             "Drift Difference (bps)": abs(mean_fwd_unfrozen - mean_fwd_frozen) * 10000
         })
+    
+    
     # --- 4b. ROUGHNESS SENSITIVITY CHECK (Convergence to H=0.5) ---
     # This proves that the gap is due to roughness, not a bug.
-    CHECK_LIMIT = True # Toggle this for one-off validation
+    # Toggle this for one-off validation
     if CHECK_LIMIT:
         print("\n" + "="*60)
         print(f"{'ROUGHNESS LIMIT CHECK (H -> 0.5)':^60}")
@@ -189,6 +199,7 @@ if __name__ == "__main__":
     price = torch_bermudan_pricer(model, specs, n_paths_pricer, time_grid, use_checkpoint=False)
     price.backward()
 
+
     # --- 6. FINAL REPORTING ---
     print_summary_table("BERMUDAN PRICING", {
         "Bermudan Price (bps)": price.item() * 10000,
@@ -203,6 +214,7 @@ if __name__ == "__main__":
     )
 
     print(f"\nTotal Session Runtime: {time.time() - t_init:.4f} seconds")
+
 
     # ============================================================
     #       MC CALIBRATION ENGINE DIAGNOSTIC TEST
