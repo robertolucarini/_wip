@@ -156,3 +156,62 @@ if __name__ == "__main__":
     )
 
     print(f"\nTotal Session Runtime: {time.time() - t_init:.4f} seconds")
+
+    # ============================================================
+    #       MC CALIBRATION ENGINE DIAGNOSTIC TEST
+    # ============================================================
+    print("\n" + "="*60)
+    print(f"{'CALIBRATION ENGINE COMPARISON (POLYNOMIAL vs ODE vs MC)':^60}")
+    print("="*60)
+    
+    # 1. Define a test case (e.g., 5-Year Expiry)
+    test_T = 5.0
+    test_alpha = 0.0150  # 150 bps base vol
+    test_rho = -0.40     # Downward skew
+    test_nu = 0.60       # Vol-of-vol
+    test_H = 0.15        # Rough Hurst
+    
+    # Strikes: ATM, +/- 50 bps, +/- 100 bps
+    test_K = np.array([-0.01, -0.005, 0.0, 0.005, 0.01]) 
+    test_T_arr = np.full_like(test_K, test_T)
+    test_alpha_arr = np.full_like(test_K, test_alpha)
+    test_rho_arr = np.full_like(test_K, test_rho)
+
+    # 2. Evaluate Polynomial Formula
+    vol_poly = calibrator.rough_sabr_vol(
+        test_K, test_T_arr, test_alpha_arr, test_rho_arr, test_nu, test_H
+    )
+
+    # 3. Evaluate ODE Formula
+    vol_ode = calibrator.rough_sabr_vol_ode(
+        test_K, test_T_arr, test_alpha_arr, test_rho_arr, test_nu, test_H
+    )
+
+    # 4. Evaluate MC Engine
+    # Note: We use 65536 paths here for a highly precise diagnostic check
+    import torch
+    device = 'cpu'
+    mc_prices_t = calibrator.rough_sabr_vol_mc.__globals__['mc_rough_bergomi_pricer'](
+        torch.tensor(test_K, device=device, dtype=torch.float64), 
+        torch.tensor(test_T_arr, device=device, dtype=torch.float64), 
+        torch.tensor(test_alpha_arr, device=device, dtype=torch.float64), 
+        torch.tensor(test_rho_arr, device=device, dtype=torch.float64), 
+        test_nu, test_H, 
+        n_paths=65536, dt=1.0/24.0, kappa_hybrid=1, device=device
+    )
+    
+    mc_prices = mc_prices_t.cpu().numpy()
+    vol_mc = calibrator.rough_sabr_vol_mc.__globals__['bachelier_iv_newton'](
+        mc_prices, test_K, test_T_arr, initial_guess_vol=test_alpha_arr
+    )
+
+    # 5. Print the Smile Comparison
+    print(f"Parameters: T={test_T}Y, Alpha={test_alpha*10000:.0f}bps, Rho={test_rho}, Nu={test_nu}, H={test_H}")
+    print("-" * 60)
+    print(f"{'Strike (bps)':>12} | {'Poly IV (bps)':>13} | {'ODE IV (bps)':>12} | {'MC IV (bps)':>11}")
+    print("-" * 60)
+    
+    for i in range(len(test_K)):
+        strike_bps = test_K[i] * 10000
+        print(f"{strike_bps:>12.0f} | {vol_poly[i]*10000:>13.2f} | {vol_ode[i]*10000:>12.2f} | {vol_mc[i]*10000:>11.2f}")
+    print("=" * 60)
