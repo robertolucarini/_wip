@@ -29,7 +29,7 @@ class TorchRoughSABR_FMM(nn.Module):
         self.register_buffer('nus', torch.tensor(nu_f(tenors[:-1]), device=device, dtype=self.dtype))
         self.register_buffer('H', torch.tensor(H, device=device, dtype=self.dtype))
 
-# Spatial Correlation Matrix Setup
+        # Spatial Correlation Matrix Setup
         if self.correlation_mode == 'pca':
             self.n_factors = n_factors
             T_mat_i, T_mat_j = self.T[:-1].unsqueeze(1), self.T[:-1].unsqueeze(0)
@@ -39,6 +39,7 @@ class TorchRoughSABR_FMM(nn.Module):
             loadings = evecs[:, idx[:self.n_factors]] * torch.sqrt(torch.clamp(evals[idx[:self.n_factors]], min=0.0)).unsqueeze(0)
             
             self.register_buffer('loadings', loadings / torch.sqrt(torch.sum(loadings**2, dim=1, keepdim=True)))
+            self.register_buffer('loadings', loadings)
             self.register_buffer('Lambda_upper', torch.triu(self.loadings @ self.loadings.T, diagonal=1))
             
         elif self.correlation_mode == 'full':
@@ -57,9 +58,15 @@ class TorchRoughSABR_FMM(nn.Module):
                 
             # Add a tiny jitter to the diagonal for numerical stability of Cholesky
             jitter = torch.eye(self.N + 1, device=device, dtype=self.dtype) * 1e-10
-            loadings = torch.linalg.cholesky(spatial_corr + jitter)
+            spatial_cov = spatial_corr + jitter
+            d = torch.sqrt(torch.clamp(torch.diagonal(spatial_cov), min=1e-16))
+            spatial_corr_pd = spatial_cov / (d.unsqueeze(1) * d.unsqueeze(0))
+            loadings = torch.linalg.cholesky(spatial_corr_pd)
             
-            self.register_buffer('loadings', loadings / torch.sqrt(torch.sum(loadings**2, dim=1, keepdim=True)))
+            # Keep raw Cholesky loadings: L @ L^T must equal the target correlation.
+            # Row-normalizing L would alter off-diagonal correlations.
+            self.register_buffer('loadings', loadings)
+
             # Lambda_upper must strictly be NxN for the forward rates drift computation
             corr_rates = self.loadings[1:, :] @ self.loadings[1:, :].T
             self.register_buffer('Lambda_upper', torch.triu(corr_rates, diagonal=1))
@@ -151,7 +158,14 @@ class TorchRoughSABR_FMM(nn.Module):
                 
             # Stochastic Volatility
             unit_vols = torch.exp(self.nus.view(1, 1, -1) * fbm - vcomp.T.unsqueeze(0))
-            v2_dt = (unit_vols ** 2 * dt)
+            # Use predictable (left-point) volatility in Euler updates.
+            # This avoids forward leakage by ensuring dW_i is multiplied by sigma_{t_i},
+            # not sigma_{t_{i+1}} that already embeds part of dW_i.
+            unit_vols_pred = torch.cat([
+                torch.ones(n_paths, 1, unit_vols.shape[-1], device=self.device, dtype=self.dtype),
+                unit_vols[:, :-1, :]
+            ], dim=1)
+            v2_dt = (unit_vols_pred ** 2 * dt)
 
             
             if freeze_drift:
@@ -165,7 +179,7 @@ class TorchRoughSABR_FMM(nn.Module):
                 
                 dF = mu_0.view(1, 1, -1) * v2_dt
                 # 3. Apply it to the diffusion (shock)
-                dF.add_(wr * (unit_vols * vol_scale.view(1, 1, -1)))
+                dF.add_(wr * (unit_vols_pred  * vol_scale.view(1, 1, -1)))
                 return torch.cat([f0.expand(n_paths, 1, -1), f0 + torch.cumsum(dF, dim=1)], dim=1)
             
             else:
@@ -182,7 +196,7 @@ class TorchRoughSABR_FMM(nn.Module):
                     drift = -vol_scale * drift_weights * v2_dt[:, i]
                     
                     # 3. Dynamic diffusion adjustment
-                    F_t = F_t + drift + wr[:, i] * (unit_vols[:, i] * vol_scale)
+                    F_t = F_t + drift + wr[:, i] * (unit_vols_pred [:, i] * vol_scale)
                     res.append(F_t.unsqueeze(1))
                 return torch.cat(res, dim=1)
             
