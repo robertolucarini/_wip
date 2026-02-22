@@ -369,7 +369,7 @@ def run_put_call_parity_test():
 
 
 if __name__ == '__main__':
-    # run_martingale_test()
-    # run_aad_vs_fd_test()
-    # run_extreme_regime_test()
+    run_martingale_test()
+    run_aad_vs_fd_test()
+    run_extreme_regime_test()
     run_put_call_parity_test()

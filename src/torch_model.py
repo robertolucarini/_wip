@@ -29,7 +29,7 @@ class TorchRoughSABR_FMM(nn.Module):
         self.register_buffer('nus', torch.tensor(nu_f(tenors[:-1]), device=device, dtype=self.dtype))
         self.register_buffer('H', torch.tensor(H, device=device, dtype=self.dtype))
 
-        # Spatial Correlation Matrix Setup
+# Spatial Correlation Matrix Setup
         if self.correlation_mode == 'pca':
             self.n_factors = n_factors
             T_mat_i, T_mat_j = self.T[:-1].unsqueeze(1), self.T[:-1].unsqueeze(0)
@@ -38,8 +38,11 @@ class TorchRoughSABR_FMM(nn.Module):
             idx = torch.argsort(evals, descending=True)
             loadings = evecs[:, idx[:self.n_factors]] * torch.sqrt(torch.clamp(evals[idx[:self.n_factors]], min=0.0)).unsqueeze(0)
             
+            self.register_buffer('loadings', loadings / torch.sqrt(torch.sum(loadings**2, dim=1, keepdim=True)))
+            self.register_buffer('Lambda_upper', torch.triu(self.loadings @ self.loadings.T, diagonal=1))
+            
         elif self.correlation_mode == 'full':
-            self.n_factors = self.N  # Full rank (N forward rates)
+            self.n_factors = self.N + 1  # Full rank (N forward rates + 1 Vol driver)
             
             if omega_matrix is not None:
                 # Use Adachi's Rapisarda Hyperspherical Angles
@@ -48,21 +51,26 @@ class TorchRoughSABR_FMM(nn.Module):
             else:
                 # Fallback to standard exponential decay if no angles provided
                 T_mat_i, T_mat_j = self.T[:-1].unsqueeze(1), self.T[:-1].unsqueeze(0)
-                spatial_corr = torch.exp(-beta_decay * torch.abs(T_mat_i - T_mat_j))
+                spatial_corr_N = torch.exp(-beta_decay * torch.abs(T_mat_i - T_mat_j))
+                spatial_corr = torch.eye(self.N + 1, device=device, dtype=self.dtype)
+                spatial_corr[1:, 1:] = spatial_corr_N
                 
             # Add a tiny jitter to the diagonal for numerical stability of Cholesky
-            jitter = torch.eye(self.N, device=device, dtype=self.dtype) * 1e-10
+            jitter = torch.eye(self.N + 1, device=device, dtype=self.dtype) * 1e-10
             loadings = torch.linalg.cholesky(spatial_corr + jitter)
+            
+            self.register_buffer('loadings', loadings / torch.sqrt(torch.sum(loadings**2, dim=1, keepdim=True)))
+            # Lambda_upper must strictly be NxN for the forward rates drift computation
+            corr_rates = self.loadings[1:, :] @ self.loadings[1:, :].T
+            self.register_buffer('Lambda_upper', torch.triu(corr_rates, diagonal=1))
             
         else:
             raise ValueError(f"Unknown correlation_mode: {self.correlation_mode}")
 
-        self.register_buffer('loadings', loadings / torch.sqrt(torch.sum(loadings**2, dim=1, keepdim=True)))
-        self.register_buffer('Lambda_upper', torch.triu(self.loadings @ self.loadings.T, diagonal=1))
-
 
     def get_terminal_bond(self):
         return torch.prod(1.0 / (1.0 + self.tau * self.F0))
+
 
     def simulate_forward_curve(self, n_paths, time_grid, seed=56, freeze_drift=True, use_checkpoint=False, scheme='hybrid', kappa=1, b_eval='optimal'):
         from torch.distributions import Normal
@@ -107,41 +115,44 @@ class TorchRoughSABR_FMM(nn.Module):
         # Discrete Martingale Correction (remains N x Steps)
         var_comp = 0.5 * (self.nus**2).unsqueeze(-1) * torch.sum(kernel**2, dim=1).unsqueeze(0) * dt
 
+        n_dims = self.n_factors + 1 if self.correlation_mode == 'pca' else self.n_factors
+        
         # sobol generator
-        sobol = torch.quasirandom.SobolEngine(dimension=n_steps * (self.n_factors + 1), scramble=True, seed=seed)
+        sobol = torch.quasirandom.SobolEngine(dimension=n_steps * n_dims, scramble=True, seed=seed)
         # draws
         u = sobol.draw(n_paths).to(self.device).to(self.dtype)
         # from uniform to standard normal distribution
         dist = Normal(torch.tensor(0.0, device=self.device), torch.tensor(1.0, device=self.device))
         # shocks
-        z = dist.icdf(torch.clamp(u, 1e-7, 1-1e-7)).view(n_paths, n_steps, self.n_factors + 1)
+        z = dist.icdf(torch.clamp(u, 1e-7, 1-1e-7)).view(n_paths, n_steps, n_dims)
         
         # time-scaled shocks
-        # macro factors
-        dz_curve = z[..., :self.n_factors] * torch.sqrt(dt)
-        # idio factor
-        dz_perp = z[..., self.n_factors:self.n_factors+1] * torch.sqrt(dt)
-        
-        # dZ @ L.T  
-        dW_r = torch.matmul(dz_curve, self.loadings.T)
+        dz_all = z * torch.sqrt(dt)
+
 
         # 3. Define Simulation Block
-        def _simulate(dz_c, dz_p, wr, kern, vcomp, f0, alphas):
-            # SPEED OPTIMIZATION: Factorized Rough Volatility
-            # Calculate 4 rough drivers (3 factors + 1 orthogonal) instead of 31
-            # shocks -> (n_paths, n_steps, n_factors)
-            dz_all = torch.cat([dz_c, dz_p], dim=-1)
-            # Kernel * dZ
-            # (n_paths, n_steps, n_factors)
-            fbm_4 = torch.matmul(dz_all.transpose(1, 2), kern.T).transpose(1, 2)
-            
-            # Reconstruct tenor fBms: fBm_i = rho_i * (sum L_ik * fBm_k) + sqrt(1-rho^2) * fBm_p
-            fbm_curve = torch.matmul(fbm_4[..., :-1], self.loadings.T)
-            fbm = self.rhos.view(1, 1, -1) * fbm_curve + torch.sqrt(1.0 - self.rhos**2).view(1, 1, -1) * fbm_4[..., -1:]
-            
+        def _simulate(dz_all_in, kern, vcomp, f0, alphas):
+            if self.correlation_mode == 'pca':
+                dz_c = dz_all_in[..., :-1]
+                dz_p = dz_all_in[..., -1:]
+                wr = torch.matmul(dz_c, self.loadings.T)
+                
+                fbm_4 = torch.matmul(dz_all_in.transpose(1, 2), kern.T).transpose(1, 2)
+                fbm_curve = torch.matmul(fbm_4[..., :-1], self.loadings.T)
+                fbm = self.rhos.view(1, 1, -1) * fbm_curve + torch.sqrt(1.0 - self.rhos**2).view(1, 1, -1) * fbm_4[..., -1:]
+            else:
+                # Full Mode (Adachi N+1 Matrix)
+                wr_all = torch.matmul(dz_all_in, self.loadings.T)
+                wr = wr_all[..., 1:] # Forward rates are rows 1 to N
+                
+                fbm_indep = torch.matmul(dz_all_in.transpose(1, 2), kern.T).transpose(1, 2)
+                fbm_all = torch.matmul(fbm_indep, self.loadings.T)
+                fbm = fbm_all[..., 0:1] # Rough Volatility Z(t) is Row 0
+                
             # Stochastic Volatility
             unit_vols = torch.exp(self.nus.view(1, 1, -1) * fbm - vcomp.T.unsqueeze(0))
             v2_dt = (unit_vols ** 2 * dt)
+
             
             if freeze_drift:
                 # 1. Calculate the shifted SABR local vol component for the frozen initial curve
@@ -178,6 +189,6 @@ class TorchRoughSABR_FMM(nn.Module):
 
         if use_checkpoint and torch.is_grad_enabled():
             import torch.utils.checkpoint as cp
-            return cp.checkpoint(_simulate, dz_curve, dz_perp, dW_r, kernel, var_comp, self.F0, self.alphas, use_reentrant=False)
+            return cp.checkpoint(_simulate, dz_all, kernel, var_comp, self.F0, self.alphas, use_reentrant=False)
         else:
-            return _simulate(dz_curve, dz_perp, dW_r, kernel, var_comp, self.F0, self.alphas)
+            return _simulate(dz_all, kernel, var_comp, self.F0, self.alphas)

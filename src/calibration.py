@@ -534,15 +534,20 @@ class CorrelationCalibrator:
         self.tenors = np.array(tenors)
         self.market_vols = np.array(vols)
         
-        # Initialize Rapisarda angles matrix (N x N)
-        self.omega = np.zeros((self.N, self.N))
+        # Initialize Rapisarda angles matrix ((N+1) x (N+1))
+        # Row 0 = Z(t) volatility driver. Rows 1 to N = Forward Rates.
+        self.omega = np.zeros((self.N + 1, self.N + 1))
         
+        # 1. Anchor the first column exactly to Stage 1 spot-volatility correlations
+        rhos_np = np.clip(self.model.rhos.detach().cpu().numpy(), -0.9999, 0.9999)
+        self.omega[1:, 0] = np.arccos(rhos_np)
+        
+        # 2. Shift spatial constraints +1 column to the right
         if self.N > 1:
-            self.omega[1, 0] = 0.0 # cos(0) = 1.0 (Perfect correlation)
+            self.omega[2, 1] = 0.0 # cos(0) = 1.0 (Perfect spatial correlation for unidentifiable short end)
         if self.N > 2:
-            self.omega[2:, 1] = np.pi / 2.0 # cos(pi/2) = 0.0 (Orthogonal)
-      
-            
+            self.omega[3:, 2] = np.pi / 2.0 # cos(pi/2) = 0.0 (Orthogonalize next unidentifiable factor)
+
     def calibrate(self):
         import time
         from src.pricers import mapped_smm_pricer, mapped_smm_ode
@@ -568,8 +573,9 @@ class CorrelationCalibrator:
             if len(exp_targets) == 0:
                 print("Skipped (No co-terminal swaptions found)")
                 continue
-                
-            free_indices = [0] + list(range(2, i))
+
+            idx = i + 1 # The corresponding row in the (N+1)x(N+1) matrix 
+            free_indices = [1] + list(range(3, idx))
             if not free_indices:
                 print("Skipped (No free correlation angles)")
                 continue
@@ -588,7 +594,7 @@ class CorrelationCalibrator:
             for ammo_iter in range(2):
                 
                 # 1. Update Matrix with current guess
-                self.omega[i, free_indices] = current_p
+                self.omega[idx, free_indices] = current_p
                 omega_tensor = torch.tensor(self.omega, device=self.device, dtype=self.model.dtype)
                 Sigma_matrix = build_rapisarda_correlation_matrix(omega_tensor)
                 
@@ -608,7 +614,7 @@ class CorrelationCalibrator:
                 
                 # 4. Define the Ultra-Fast Surrogate Objective
                 def ammo_surrogate(p_inner):
-                    self.omega[i, free_indices] = p_inner
+                    self.omega[idx, free_indices] = p_inner
                     o_t = torch.tensor(self.omega, device=self.device, dtype=self.model.dtype)
                     S_mat = build_rapisarda_correlation_matrix(o_t)
                     v_surr = mapped_smm_ode(self.model, S_mat, exp_targets, ten_targets, strikes)
@@ -619,7 +625,7 @@ class CorrelationCalibrator:
                     def _diff_obj(p_tensor):
                         # Safely reconstruct omega tensor for Autograd tracking
                         o_mod = torch.tensor(self.omega, device=self.device, dtype=self.model.dtype).clone()
-                        o_mod[i, free_indices] = p_tensor  # Inject differentiable variables
+                        o_mod[idx, free_indices] = p_tensor  # Inject differentiable variables
                         
                         S_mat = build_rapisarda_correlation_matrix(o_mod)
                         v_surr = mapped_smm_ode(self.model, S_mat, exp_targets, ten_targets, strikes)
@@ -640,7 +646,7 @@ class CorrelationCalibrator:
                 current_p = res.x
                 
             # Lock in the best verified angles
-            self.omega[i, free_indices] = best_p
+            self.omega[idx, free_indices] = best_p
             
             row_time = time.time() - row_start_time
             print(f"Done! RMSE: {best_mc_rmse:5.2f} bps | Time: {row_time:4.2f}s")

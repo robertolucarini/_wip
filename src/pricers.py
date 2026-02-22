@@ -146,16 +146,19 @@ def mapped_smm_pricer(model, Sigma_matrix, expiries, tenors, strike_offsets, dt=
             pi_weights[j_local] = Pi_j * alpha_normal[j_global]
             
         # Mapped Normal Variance (Adachi Eq 22 modified for Normal dynamics)
-        Sigma_slice = Sigma_matrix[start_idx:end_idx, start_idx:end_idx]
+        # Shift bounds by +1 because row/col 0 is now the Z(t) volatility driver
+        Sigma_slice = Sigma_matrix[start_idx+1 : end_idx+1, start_idx+1 : end_idx+1]
         v_0 = torch.matmul(pi_weights.unsqueeze(0), torch.matmul(Sigma_slice, pi_weights.unsqueeze(1))).squeeze()
         
         a_smm = torch.sqrt(torch.clamp(v_0, min=1e-14))
         alpha_smm[i] = a_smm
         
         # Mapped Vol-of-Vol Correlation (Adachi Eq 24)
-        rho_slice = model.rhos[start_idx:end_idx]
+        # Extract rho natively from the 0-th column of the (N+1)x(N+1) spatial matrix!
+        rho_slice = Sigma_matrix[start_idx+1 : end_idx+1, 0]
         rho_mapped = torch.sum(rho_slice * pi_weights) / a_smm
         rho_smm[i] = torch.clamp(rho_mapped, -0.999, 0.999)
+
 
     # 2. Price using the ultra-fast 1D Rough Bergomi MC Engine
     K_flat = torch.tensor(strike_offsets, device=device, dtype=dtype)
@@ -222,16 +225,18 @@ def mapped_smm_ode(model, Sigma_matrix, expiries, tenors, strike_offsets):
             Pi_j = (tau[j_global] * P0[j_global+1]) / (A0 * P0[j_global]) * (P_J + S0 * sum_P)
             pi_weights[j_local] = Pi_j * alpha_normal[j_global]
             
-        Sigma_slice = Sigma_matrix[start_idx:end_idx, start_idx:end_idx]
+        # Shift bounds by +1 to extract the pure forward rate sub-block
+        Sigma_slice = Sigma_matrix[start_idx+1 : end_idx+1, start_idx+1 : end_idx+1]
         v_0 = torch.matmul(pi_weights.unsqueeze(0), torch.matmul(Sigma_slice, pi_weights.unsqueeze(1))).squeeze()
         
         a_smm = torch.sqrt(torch.clamp(v_0, min=1e-14))
         alpha_smm_list.append(a_smm)
         
-        rho_slice = model.rhos[start_idx:end_idx]
+        # Extract rho natively from the 0-th column of the anchored matrix
+        rho_slice = Sigma_matrix[start_idx+1 : end_idx+1, 0]
         rho_mapped = torch.sum(rho_slice * pi_weights) / a_smm
         rho_smm_list.append(torch.clamp(rho_mapped, -0.999, 0.999))
-
+              
     # Convert accumulated lists back to stacked tensors for vectorized math
     alpha_smm = torch.stack(alpha_smm_list)
     rho_smm = torch.stack(rho_smm_list)
