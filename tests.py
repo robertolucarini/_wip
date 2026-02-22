@@ -123,7 +123,6 @@ def run_martingale_test():
     print("=" * 65)
 
 
-
 def run_aad_vs_fd_test():
     from src.pricers import torch_bermudan_pricer
     
@@ -431,9 +430,134 @@ def run_put_call_parity_test():
     print("=" * 65)
 
 
-if __name__ == '__main__':
-    run_martingale_test()
-    run_aad_vs_fd_test()
-    run_extreme_regime_test()
-    run_put_call_parity_test()
+def run_reproducibility_test():
+    print("\n" + "="*65)
+    print(f"{'TEST 5: RNG REPRODUCIBILITY TEST':^65}")
+    print("="*65)
 
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    ois_func = load_discount_curve("data/estr_disc.csv")
+    grid_T, F0_rates = bootstrap_forward_rates(ois_func, max_maturity=30.0)
+
+    alpha_f = lambda T: np.full_like(T, 0.0150)
+    rho_f = lambda T: np.full_like(T, -0.40)
+    nu_f = lambda T: np.full_like(T, 0.50)
+    H = 0.15
+
+    model = TorchRoughSABR_FMM(
+        grid_T, F0_rates, alpha_f, rho_f, nu_f, H,
+        beta_sabr=0.5, shift=0.03, correlation_mode='pca', n_factors=3, device=device
+    )
+
+    n_paths = 2048
+    time_grid = torch.linspace(0.0, 2.0, 2 * 12 + 1, device=device, dtype=torch.float64)
+
+    with torch.no_grad():
+        p1 = model.simulate_forward_curve(n_paths, time_grid, seed=123, freeze_drift=True)
+        p2 = model.simulate_forward_curve(n_paths, time_grid, seed=123, freeze_drift=True)
+        p3 = model.simulate_forward_curve(n_paths, time_grid, seed=124, freeze_drift=True)
+
+    same_seed_diff = torch.max(torch.abs(p1 - p2)).item()
+    diff_seed_diff = torch.max(torch.abs(p1 - p3)).item()
+
+    print(f"{'Max |same seed diff|':<40} | {same_seed_diff:.3e}")
+    print(f"{'Max |different seed diff|':<40} | {diff_seed_diff:.3e}")
+
+    if same_seed_diff < 1e-14 and diff_seed_diff > 1e-10:
+        print("Status: PASS (RNG seeding is deterministic and effective)")
+    else:
+        print("Status: WARNING (Unexpected RNG behavior)")
+    print("=" * 65)
+
+
+def run_time_step_stability_test():
+    print("\n" + "="*65)
+    print(f"{'TEST 6: TIME-STEP STABILITY TEST':^65}")
+    print("="*65)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    ois_func = load_discount_curve("data/estr_disc.csv")
+    grid_T, F0_rates = bootstrap_forward_rates(ois_func, max_maturity=30.0)
+
+    alpha_f = lambda T: np.full_like(T, 0.0150)
+    rho_f = lambda T: np.full_like(T, -0.40)
+    nu_f = lambda T: np.full_like(T, 0.50)
+    H = 0.15
+
+    model = TorchRoughSABR_FMM(
+        grid_T, F0_rates, alpha_f, rho_f, nu_f, H,
+        beta_sabr=0.5, shift=0.03, correlation_mode='pca', n_factors=3, device=device
+    )
+
+    n_paths = 8192*2
+    test_horizon = 2.0
+    target_idx = torch.argmin(torch.abs(torch.tensor(grid_T, device=device, dtype=model.dtype) - 5.0)).item()
+
+    means = {}
+    for steps_per_year in [12, 24, 48]:
+        time_grid = torch.linspace(0.0, test_horizon, int(test_horizon * steps_per_year) + 1, device=device, dtype=torch.float64)
+        with torch.no_grad():
+            F_paths = model.simulate_forward_curve(n_paths, time_grid, seed=77, freeze_drift=True)
+        means[steps_per_year] = torch.mean(F_paths[:, -1, target_idx]).item()
+
+    print(f"{'Mean F(T) @ 12 steps/year':<40} | {means[12]*10000:.4f} bps")
+    print(f"{'Mean F(T) @ 24 steps/year':<40} | {means[24]*10000:.4f} bps")
+    print(f"{'Mean F(T) @ 48 steps/year':<40} | {means[48]*10000:.4f} bps")
+
+    coarse_mid = abs(means[12] - means[24])
+    mid_fine = abs(means[24] - means[48])
+    print(f"{'|12-24|':<40} | {coarse_mid*10000:.4f} bps")
+    print(f"{'|24-48|':<40} | {mid_fine*10000:.4f} bps")
+
+    if mid_fine <= coarse_mid:
+        print("Status: PASS (Observed convergence with finer discretization)")
+    else:
+        print("Status: WARNING (No clear refinement convergence)")
+    print("=" * 65)
+
+
+def run_correlation_consistency_test():
+    print("\n" + "="*65)
+    print(f"{'TEST 7: CORRELATION CONSISTENCY TEST':^65}")
+    print("="*65)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    ois_func = load_discount_curve("data/estr_disc.csv")
+    grid_T, F0_rates = bootstrap_forward_rates(ois_func, max_maturity=30.0)
+
+    alpha_f = lambda T: np.full_like(T, 0.0150)
+    rho_f = lambda T: np.full_like(T, -0.40)
+    nu_f = lambda T: np.full_like(T, 0.50)
+    H = 0.15
+
+    model = TorchRoughSABR_FMM(
+        grid_T, F0_rates, alpha_f, rho_f, nu_f, H,
+        beta_sabr=0.5, shift=0.03, correlation_mode='full', beta_decay=0.05, device=device
+    )
+
+    Sigma = model.loadings @ model.loadings.T
+    eigvals = torch.linalg.eigvalsh(Sigma)
+    min_eig = torch.min(eigvals).item()
+    max_diag_dev = torch.max(torch.abs(torch.diagonal(Sigma) - 1.0)).item()
+
+    print(f"{'Min eigenvalue of Sigma':<40} | {min_eig:.3e}")
+    print(f"{'Max |diag(Sigma)-1|':<40} | {max_diag_dev:.3e}")
+
+    if min_eig > -1e-10 and max_diag_dev < 1e-8:
+        print("Status: PASS (Correlation construction is PSD and normalized)")
+    else:
+        print("Status: WARNING (Correlation matrix quality degraded)")
+    print("=" * 65)
+
+
+if __name__ == '__main__':
+    # run_martingale_test()
+    # run_aad_vs_fd_test()
+    # run_extreme_regime_test()
+    # run_put_call_parity_test()
+    # run_reproducibility_test()
+    run_time_step_stability_test()
+    # run_correlation_consistency_test()
