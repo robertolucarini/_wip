@@ -5,6 +5,99 @@ from src.torch_model import TorchRoughSABR_FMM
 from src.utils import bootstrap_forward_rates, load_discount_curve
 
 
+def run_aad_vs_fd_test():
+    from src.pricers import torch_bermudan_pricer
+    
+    print("\n" + "="*65)
+    print(f"{'TEST 1: AAD vs FINITE DIFFERENCE (BUMP) TEST':^65}")
+    print("="*65)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # 1. Setup Standard Market & Model
+    print("[Setup] Initializing Production FMM Parameters...")
+    ois_func = load_discount_curve("data/estr_disc.csv")
+    grid_T, F0_rates = bootstrap_forward_rates(ois_func, max_maturity=30.0)
+    
+    # Standard realistic parameters
+    alpha_f = lambda T: np.full_like(T, 0.0150) 
+    rho_f = lambda T: np.full_like(T, -0.40)    
+    nu_f = lambda T: np.full_like(T, 0.50)      
+    H = 0.15                                    
+    
+    # Create the BASE model
+    model = TorchRoughSABR_FMM(
+        grid_T, F0_rates, alpha_f, rho_f, nu_f, H, 
+        beta_sabr=0.5, shift=0.03, correlation_mode='pca', n_factors=3, device=device
+    )
+    
+    specs = {'Strike': F0_rates[1], 'Ex_Dates': [1.0, 2.0, 3.0, 4.0, 5.0]}
+    n_paths = 32768 # High path count for stable Finite Differences
+    n_steps_per_year = 24
+    time_grid = torch.linspace(0.0, 5.0, 5 * n_steps_per_year + 1, device=device, dtype=torch.float64)
+    
+    # We will test the Delta sensitivity to the 6-Year Forward Rate
+    target_idx = torch.argmin(torch.abs(torch.tensor(grid_T) - 6.0)).item()
+    target_tenor = grid_T[target_idx]
+    
+    # ---------------------------------------------------------
+    # PART A: EXACT AAD (PYTORCH)
+    # ---------------------------------------------------------
+    print(f"\n[AAD] Computing Exact PyTorch Sensitivities...")
+    t0 = time.time()
+    price_base = torch_bermudan_pricer(model, specs, n_paths, time_grid, use_checkpoint=False)
+    price_base.backward()
+    
+    # Scale to bps (PV01)
+    aad_delta = model.F0.grad[target_idx].item() * 10000 * 0.0001
+    print(f"[AAD] Done in {time.time() - t0:.2f}s")
+    
+    # ---------------------------------------------------------
+    # PART B: FINITE DIFFERENCE (BUMP)
+    # ---------------------------------------------------------
+    print(f"\n[BUMP] Computing Finite Difference (1 bp bump)...")
+    
+    # Create a completely fresh model with the exact same seed, but bumped F0
+    bump_size = 0.0001 # 1 basis point
+    F0_bumped = F0_rates.copy()
+    F0_bumped[target_idx] += bump_size
+    
+    model_bumped = TorchRoughSABR_FMM(
+        grid_T, F0_bumped, alpha_f, rho_f, nu_f, H, 
+        beta_sabr=0.5, shift=0.03, correlation_mode='pca', n_factors=3, device=device
+    )
+    
+    t0 = time.time()
+    with torch.no_grad(): # No autograd needed for pure bumping
+        price_up = torch_bermudan_pricer(model_bumped, specs, n_paths, time_grid, use_checkpoint=False)
+        
+    # FD Delta = (Price_Up - Price_Base) (in bps)
+    fd_delta = (price_up.item() - price_base.item()) * 10000
+    print(f"[BUMP] Done in {time.time() - t0:.2f}s")
+    
+    # ---------------------------------------------------------
+    # RESULTS
+    # ---------------------------------------------------------
+    print("\n" + "-" * 65)
+    print(f"{'Metric':<30} | {'Value'}")
+    print("-" * 65)
+    print(f"{'Target Forward Rate':<30} | {target_tenor}Y")
+    print(f"{'Base Bermudan Price':<30} | {price_base.item() * 10000:.4f} bps")
+    print(f"{'Bumped Bermudan Price':<30} | {price_up.item() * 10000:.4f} bps")
+    print("-" * 65)
+    print(f"{'Exact PyTorch AAD Delta':<30} | {aad_delta:.6f} bps")
+    print(f"{'Finite Difference Delta':<30} | {fd_delta:.6f} bps")
+    
+    diff = abs(aad_delta - fd_delta)
+    print(f"{'Absolute Difference':<30} | {diff:.6f} bps")
+    
+    if diff < 0.1:
+        print("\nStatus: PASS (AAD Graph is flawlessly preserved!)")
+    else:
+        print("\nStatus: WARNING (Significant deviation in exercise boundary)")
+    print("=" * 65)
+
+
 def run_martingale_test():
     print("\n" + "="*65)
     print(f"{'TEST 2: STRICT MARTINGALE (NO-ARBITRAGE) TEST':^65}")
@@ -120,99 +213,6 @@ def run_martingale_test():
         print("Status: PASS (Martingale Dynamics within tolerance)")
     else:
         print("Status: WARNING (Significant discretization bias on valid paths)")
-    print("=" * 65)
-
-
-def run_aad_vs_fd_test():
-    from src.pricers import torch_bermudan_pricer
-    
-    print("\n" + "="*65)
-    print(f"{'TEST 1: AAD vs FINITE DIFFERENCE (BUMP) TEST':^65}")
-    print("="*65)
-
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    # 1. Setup Standard Market & Model
-    print("[Setup] Initializing Production FMM Parameters...")
-    ois_func = load_discount_curve("data/estr_disc.csv")
-    grid_T, F0_rates = bootstrap_forward_rates(ois_func, max_maturity=30.0)
-    
-    # Standard realistic parameters
-    alpha_f = lambda T: np.full_like(T, 0.0150) 
-    rho_f = lambda T: np.full_like(T, -0.40)    
-    nu_f = lambda T: np.full_like(T, 0.50)      
-    H = 0.15                                    
-    
-    # Create the BASE model
-    model = TorchRoughSABR_FMM(
-        grid_T, F0_rates, alpha_f, rho_f, nu_f, H, 
-        beta_sabr=0.5, shift=0.03, correlation_mode='pca', n_factors=3, device=device
-    )
-    
-    specs = {'Strike': F0_rates[1], 'Ex_Dates': [1.0, 2.0, 3.0, 4.0, 5.0]}
-    n_paths = 32768 # High path count for stable Finite Differences
-    n_steps_per_year = 24
-    time_grid = torch.linspace(0.0, 5.0, 5 * n_steps_per_year + 1, device=device, dtype=torch.float64)
-    
-    # We will test the Delta sensitivity to the 6-Year Forward Rate
-    target_idx = torch.argmin(torch.abs(torch.tensor(grid_T) - 6.0)).item()
-    target_tenor = grid_T[target_idx]
-    
-    # ---------------------------------------------------------
-    # PART A: EXACT AAD (PYTORCH)
-    # ---------------------------------------------------------
-    print(f"\n[AAD] Computing Exact PyTorch Sensitivities...")
-    t0 = time.time()
-    price_base = torch_bermudan_pricer(model, specs, n_paths, time_grid, use_checkpoint=False)
-    price_base.backward()
-    
-    # Scale to bps (PV01)
-    aad_delta = model.F0.grad[target_idx].item() * 10000 * 0.0001
-    print(f"[AAD] Done in {time.time() - t0:.2f}s")
-    
-    # ---------------------------------------------------------
-    # PART B: FINITE DIFFERENCE (BUMP)
-    # ---------------------------------------------------------
-    print(f"\n[BUMP] Computing Finite Difference (1 bp bump)...")
-    
-    # Create a completely fresh model with the exact same seed, but bumped F0
-    bump_size = 0.0001 # 1 basis point
-    F0_bumped = F0_rates.copy()
-    F0_bumped[target_idx] += bump_size
-    
-    model_bumped = TorchRoughSABR_FMM(
-        grid_T, F0_bumped, alpha_f, rho_f, nu_f, H, 
-        beta_sabr=0.5, shift=0.03, correlation_mode='pca', n_factors=3, device=device
-    )
-    
-    t0 = time.time()
-    with torch.no_grad(): # No autograd needed for pure bumping
-        price_up = torch_bermudan_pricer(model_bumped, specs, n_paths, time_grid, use_checkpoint=False)
-        
-    # FD Delta = (Price_Up - Price_Base) (in bps)
-    fd_delta = (price_up.item() - price_base.item()) * 10000
-    print(f"[BUMP] Done in {time.time() - t0:.2f}s")
-    
-    # ---------------------------------------------------------
-    # RESULTS
-    # ---------------------------------------------------------
-    print("\n" + "-" * 65)
-    print(f"{'Metric':<30} | {'Value'}")
-    print("-" * 65)
-    print(f"{'Target Forward Rate':<30} | {target_tenor}Y")
-    print(f"{'Base Bermudan Price':<30} | {price_base.item() * 10000:.4f} bps")
-    print(f"{'Bumped Bermudan Price':<30} | {price_up.item() * 10000:.4f} bps")
-    print("-" * 65)
-    print(f"{'Exact PyTorch AAD Delta':<30} | {aad_delta:.6f} bps")
-    print(f"{'Finite Difference Delta':<30} | {fd_delta:.6f} bps")
-    
-    diff = abs(aad_delta - fd_delta)
-    print(f"{'Absolute Difference':<30} | {diff:.6f} bps")
-    
-    if diff < 0.1:
-        print("\nStatus: PASS (AAD Graph is flawlessly preserved!)")
-    else:
-        print("\nStatus: WARNING (Significant deviation in exercise boundary)")
     print("=" * 65)
 
 
@@ -554,10 +554,10 @@ def run_correlation_consistency_test():
 
 
 if __name__ == '__main__':
-    # run_martingale_test()
-    # run_aad_vs_fd_test()
-    # run_extreme_regime_test()
-    # run_put_call_parity_test()
+    run_martingale_test()
+    run_aad_vs_fd_test()
+    run_extreme_regime_test()
+    run_put_call_parity_test()
     # run_reproducibility_test()
-    run_time_step_stability_test()
+    # run_time_step_stability_test()
     # run_correlation_consistency_test()

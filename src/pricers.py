@@ -3,7 +3,6 @@ from src.utils import log_progress
 import numpy as np
 
 
-
 def torch_bachelier(F, K, T, vol):
     """ Differentiable Bachelier price for validation and Control Variates. """
     from torch.distributions import Normal
@@ -90,13 +89,6 @@ def mapped_smm_pricer(model, Sigma_matrix, expiries, tenors, strike_offsets, dt=
     """
     Prices a set of swaptions using the Mapped SMM (Adachi et al. 2025) approximation.
     Maps the NxN FMM into 1D Rough Bergomi parameters per swaption, then leverages the fast 1D MC engine.
-    
-    Args:
-        model: TorchRoughSABR_FMM instance containing the base curve and 1D marginals
-        Sigma_matrix: (N, N) spatial correlation matrix tensor (from Rapisarda generator)
-        expiries: list/array of option expiries (in years)
-        tenors: list/array of underlying swap tenors (in years)
-        strike_offsets: list/array of strikes relative to ATM (e.g., 0.0 for ATM)
     """
     # Local import to prevent circular dependencies
     from src.calibration import mc_rough_bergomi_pricer, bachelier_iv_newton
@@ -112,6 +104,7 @@ def mapped_smm_pricer(model, Sigma_matrix, expiries, tenors, strike_offsets, dt=
     
     alpha_smm = torch.zeros(n_options, device=device, dtype=dtype)
     rho_smm = torch.zeros(n_options, device=device, dtype=dtype)
+    nu_smm = torch.zeros(n_options, device=device, dtype=dtype)
     
     # Calculate true Normal volatility of forward rates at t=0
     eta_F0 = torch.pow(torch.abs(F0 + model.shift), model.beta_sabr)
@@ -145,19 +138,21 @@ def mapped_smm_pricer(model, Sigma_matrix, expiries, tenors, strike_offsets, dt=
             # pi_j maps the normal volatility of the forward rate to the swap rate
             pi_weights[j_local] = Pi_j * alpha_normal[j_global]
             
-        # Mapped Normal Variance (Adachi Eq 22 modified for Normal dynamics)
-        # Shift bounds by +1 because row/col 0 is now the Z(t) volatility driver
+        # Mapped Normal Variance
         Sigma_slice = Sigma_matrix[start_idx+1 : end_idx+1, start_idx+1 : end_idx+1]
         v_0 = torch.matmul(pi_weights.unsqueeze(0), torch.matmul(Sigma_slice, pi_weights.unsqueeze(1))).squeeze()
         
         a_smm = torch.sqrt(torch.clamp(v_0, min=1e-14))
         alpha_smm[i] = a_smm
         
-        # Mapped Vol-of-Vol Correlation (Adachi Eq 24)
-        # Extract rho natively from the 0-th column of the (N+1)x(N+1) spatial matrix!
+        # Mapped Vol-of-Vol Correlation
         rho_slice = Sigma_matrix[start_idx+1 : end_idx+1, 0]
         rho_mapped = torch.sum(rho_slice * pi_weights) / a_smm
         rho_smm[i] = torch.clamp(rho_mapped, -0.999, 0.999)
+
+        # Mapped Volatility-of-Volatility (Pi-weighted average)
+        nu_mapped = torch.sum(model.nus[start_idx:end_idx] * pi_weights) / (torch.sum(pi_weights) + 1e-12)
+        nu_smm[i] = nu_mapped
 
 
     # 2. Price using the ultra-fast 1D Rough Bergomi MC Engine
@@ -167,7 +162,7 @@ def mapped_smm_pricer(model, Sigma_matrix, expiries, tenors, strike_offsets, dt=
     # We evaluate the MC engine just once for all swaptions simultaneously!
     mc_prices = mc_rough_bergomi_pricer(
         K_flat, T_flat, alpha_smm, rho_smm, 
-        model.nus[0].item(), model.H.item(), 
+        nu_smm, model.H.item(), 
         n_paths=n_paths, dt=dt, kappa_hybrid=1, device=device
     )
     
@@ -200,6 +195,7 @@ def mapped_smm_ode(model, Sigma_matrix, expiries, tenors, strike_offsets):
     # Use lists to accumulate tensors. This preserves the Autograd computational graph!
     alpha_smm_list = []
     rho_smm_list = []
+    nu_smm_list = []
     
     for i in range(n_options):
         T_exp = expiries[i]
@@ -211,6 +207,7 @@ def mapped_smm_ode(model, Sigma_matrix, expiries, tenors, strike_offsets):
         if end_idx <= start_idx:
             alpha_smm_list.append(torch.tensor(1e-5, device=device, dtype=dtype))
             rho_smm_list.append(torch.tensor(0.0, device=device, dtype=dtype))
+            nu_smm_list.append(torch.tensor(model.nus[0].item(), device=device, dtype=dtype))
             continue
             
         P_I = P0[start_idx]
@@ -225,26 +222,31 @@ def mapped_smm_ode(model, Sigma_matrix, expiries, tenors, strike_offsets):
             Pi_j = (tau[j_global] * P0[j_global+1]) / (A0 * P0[j_global]) * (P_J + S0 * sum_P)
             pi_weights[j_local] = Pi_j * alpha_normal[j_global]
             
-        # Shift bounds by +1 to extract the pure forward rate sub-block
+        # Mapped Normal Variance
         Sigma_slice = Sigma_matrix[start_idx+1 : end_idx+1, start_idx+1 : end_idx+1]
         v_0 = torch.matmul(pi_weights.unsqueeze(0), torch.matmul(Sigma_slice, pi_weights.unsqueeze(1))).squeeze()
         
         a_smm = torch.sqrt(torch.clamp(v_0, min=1e-14))
         alpha_smm_list.append(a_smm)
         
-        # Extract rho natively from the 0-th column of the anchored matrix
+        # Mapped Vol-of-Vol Correlation
         rho_slice = Sigma_matrix[start_idx+1 : end_idx+1, 0]
         rho_mapped = torch.sum(rho_slice * pi_weights) / a_smm
         rho_smm_list.append(torch.clamp(rho_mapped, -0.999, 0.999))
+
+        # Mapped Volatility-of-Volatility
+        nu_mapped = torch.sum(model.nus[start_idx:end_idx] * pi_weights) / (torch.sum(pi_weights) + 1e-12)
+        nu_smm_list.append(nu_mapped)
               
     # Convert accumulated lists back to stacked tensors for vectorized math
     alpha_smm = torch.stack(alpha_smm_list)
     rho_smm = torch.stack(rho_smm_list)
+    nu_smm = torch.stack(nu_smm_list)
     
     # 2. Evaluate Pure PyTorch ODE (Fukasawa-Gatheral Expansion)
     k_t = torch.tensor(strike_offsets, device=device, dtype=dtype)
     T_t = torch.tensor(expiries, device=device, dtype=dtype)
-    nu = model.nus[0]
+    nu = nu_smm
     H = model.H
     
     y = (nu * (T_t**(H - 0.5)) * k_t) / alpha_smm
@@ -273,5 +275,3 @@ def mapped_smm_ode(model, Sigma_matrix, expiries, tenors, strike_offsets):
     
     # Return Implied Volatility (in absolute terms)
     return alpha_smm * ratio
-
-

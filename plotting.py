@@ -336,23 +336,22 @@ def main():
     parser.add_argument('--output-params', default='pics/optimal_parameter_term_structure.png')
     args = parser.parse_args()
 
-    # Call all plots together (toggle by commenting out individual calls if needed):
-        # make_market_vs_model_surface_plot(
-        #     vol_csv=args.vol_csv,
-        #     underlying_tenor=args.underlying_tenor,
-        #     underlying_index=args.underlying_index,
-        #     calibration_method=args.calibration_method,
-        #     surface_method=args.surface_method,
-        #     output_path=args.output_surface,
-        # )
-
-    make_optimal_parameter_term_structure_plot(
+    make_market_vs_model_surface_plot(
         vol_csv=args.vol_csv,
         underlying_tenor=args.underlying_tenor,
         underlying_index=args.underlying_index,
         calibration_method=args.calibration_method,
-        output_path=args.output_params,
+        surface_method=args.surface_method,
+        output_path=args.output_surface,
     )
+
+    # make_optimal_parameter_term_structure_plot(
+    #     vol_csv=args.vol_csv,
+    #     underlying_tenor=args.underlying_tenor,
+    #     underlying_index=args.underlying_index,
+    #     calibration_method=args.calibration_method,
+    #     output_path=args.output_params,
+    # )
 
 
 if __name__ == '__main__':

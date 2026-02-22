@@ -12,12 +12,21 @@ import pandas as pd
 
 
 
-def mc_rough_bergomi_pricer(K_flat, T_flat, alpha_flat, rho_flat, nu, H, n_paths=(32768/2), dt=1.0/50.0, kappa_hybrid=1, device='cpu'):
+def mc_rough_bergomi_pricer(K_flat, T_flat, alpha_flat, rho_flat, nu_in, H, n_paths=(32768/2), dt=1.0/50.0, kappa_hybrid=1, device='cpu'):
     """
     Ultra-fast PyTorch Monte Carlo Engine for 1D Rough Bergomi pricing.
     Uses the Bennedsen Hybrid Scheme and Bachelier Control Variates for massive variance reduction.
     """
     dtype = torch.float64
+    
+    # Safely handle 'nu_in' whether it's passed as a scalar float or a full tensor array
+    if not isinstance(nu_in, torch.Tensor):
+        nu_tensor = torch.tensor(nu_in, device=device, dtype=dtype)
+    else:
+        nu_tensor = nu_in.clone().detach().to(dtype=dtype, device=device)
+        
+    if nu_tensor.dim() == 0:
+        nu_tensor = nu_tensor.expand(len(T_flat))
     
     # 1. Setup Time Grid (simulate once up to the longest expiry)
     max_T = float(torch.max(T_flat))
@@ -39,9 +48,6 @@ def mc_rough_bergomi_pricer(K_flat, T_flat, alpha_flat, rho_flat, nu, H, n_paths
     t_idx, s_idx = diag_idx[:, None], diag_idx[None, :]
     kernel = torch.where(t_idx >= s_idx, kernel, torch.tensor(0.0, dtype=dtype, device=device))
     
-    # Variance compensator for exact discrete martingale
-    var_comp = 0.5 * (nu**2) * torch.sum(kernel**2, dim=1) * dt
-    
     # 3. Sobol Random Draws (Anti-thetic / Scrambled)
     sobol = torch.quasirandom.SobolEngine(dimension=n_steps * 2, scramble=True, seed=42)
     u = sobol.draw(n_paths).to(device).to(dtype)
@@ -51,13 +57,8 @@ def mc_rough_bergomi_pricer(K_flat, T_flat, alpha_flat, rho_flat, nu, H, n_paths
     dz_vol = z[..., 0] * torch.sqrt(dt_tensor)
     dz_perp = z[..., 1] * torch.sqrt(dt_tensor)
     
-    # 4. Global Volatility Process Generation
+    # 4. Global Volatility Process Generation Base
     fbm = torch.matmul(dz_vol, kernel.T)
-    unit_vols = torch.exp(nu * fbm - var_comp.unsqueeze(0))
-    
-    # SHIFT volatility by 1 step to make it predictable (Euler-Maruyama strict adherence)
-    # This prevents forward leakage and the massive spurious negative drift.
-    unit_vols_shifted = torch.cat([torch.ones(n_paths, 1, device=device, dtype=dtype), unit_vols[:, :-1]], dim=1)
     
     # Pre-map expiries to step indices
     step_indices = torch.clamp(torch.round(T_flat / dt).long() - 1, 0, n_steps - 1)
@@ -70,6 +71,15 @@ def mc_rough_bergomi_pricer(K_flat, T_flat, alpha_flat, rho_flat, nu, H, n_paths
         r = rho_flat[i]
         k = K_flat[i]
         T = T_flat[i]
+        n_i = nu_tensor[i]
+        
+        # Variance compensator and unit vols using THIS expiry's nu parameter
+        var_comp = 0.5 * (n_i**2) * torch.sum(kernel**2, dim=1) * dt
+        unit_vols = torch.exp(n_i * fbm - var_comp.unsqueeze(0))
+        
+        # SHIFT volatility by 1 step to make it predictable (Euler-Maruyama strict adherence)
+        # This prevents forward leakage and the massive spurious negative drift.
+        unit_vols_shifted = torch.cat([torch.ones(n_paths, 1, device=device, dtype=dtype), unit_vols[:, :-1]], dim=1)
         
         # Spot process correlated shocks
         dz_spot = r * dz_vol[:, :idx+1] + torch.sqrt(1.0 - r**2) * dz_perp[:, :idx+1]
@@ -232,11 +242,12 @@ class RoughSABRCalibrator:
 
 
     def _obj(self, p, H, method):
-        # Unpack params: [rho_1...rho_n, nu_global]
-        rhos, nu_global = p[:self.n_exp], p[-1]
+        # Unpack params: [rho_1...rho_n, nu_1...nu_n]
+        rhos, nus = p[:self.n_exp], p[self.n_exp:]
         
-        # Interpolate rho(T) term structure
+        # Interpolate rho(T) and nu(T) term structures
         r_ts = PchipInterpolator(self.expiries, rhos, extrapolate=True)
+        n_ts = PchipInterpolator(self.expiries, nus, extrapolate=True)
         
         # Select the pricing method
         if method == 'polynomial':
@@ -244,7 +255,7 @@ class RoughSABRCalibrator:
                 self.K_flat, self.T_flat, 
                 self.alpha_ts(self.T_flat), 
                 r_ts(self.T_flat), 
-                nu_global, 
+                n_ts(self.T_flat), 
                 H
             )
         elif method == 'ODE':
@@ -252,7 +263,7 @@ class RoughSABRCalibrator:
                 self.K_flat, self.T_flat, 
                 self.alpha_ts(self.T_flat), 
                 r_ts(self.T_flat), 
-                nu_global, 
+                n_ts(self.T_flat), 
                 H
             )
         elif method == 'MC':
@@ -260,7 +271,7 @@ class RoughSABRCalibrator:
                 self.K_flat, self.T_flat, 
                 self.alpha_ts(self.T_flat), 
                 r_ts(self.T_flat), 
-                nu_global, 
+                n_ts(self.T_flat), 
                 H
             )
         else:
@@ -272,7 +283,7 @@ class RoughSABRCalibrator:
     def calibrate(self, method='MC', H_grid=np.array([0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50])):
         import time
         print("\n" + "="*60)
-        print(f"{f'ROUGH SABR 1D CALIBRATION (GLOBAL NU | {method.upper()})':^60}")
+        print(f"{f'ROUGH SABR 1D CALIBRATION (TERM STRUCTURE NU | {method.upper()})':^60}")
         print("="*60)
         
         best_rmse = np.inf
@@ -285,10 +296,10 @@ class RoughSABRCalibrator:
         atm_val_strike = self.strike_offsets[atm_idx]
         base_market_alphas = self.vol_matrix.iloc[:, atm_idx].values.copy()
         
-        # 2. REDUCED PARAMETER SPACE: ONLY [rhos (n_exp), nu_global (1)]
-        guess = np.concatenate([np.full(self.n_exp, -0.1), [0.4]])
-        low_bounds = np.concatenate([np.full(self.n_exp, -0.99), [0.001]])
-        high_bounds = np.concatenate([np.full(self.n_exp, 0.99), [5.0]])
+        # 2. FULL PARAMETER SPACE: [rhos (n_exp), nus (n_exp)]
+        guess = np.concatenate([np.full(self.n_exp, -0.1), np.full(self.n_exp, 0.4)])
+        low_bounds = np.concatenate([np.full(self.n_exp, -0.99), np.full(self.n_exp, 0.001)])
+        high_bounds = np.concatenate([np.full(self.n_exp, 0.99), np.full(self.n_exp, 5.0)])
         
         start_time_total = time.time()
         
@@ -297,22 +308,24 @@ class RoughSABRCalibrator:
             print(f"Grid {i+1:2d}/{len(H_grid)} | Testing Hurst (H) = {H:.3f} | ", end="", flush=True)
             
             # Fast ODE Helper (alphas are now passed externally)
-            def run_ode(alphas_in, rhos_in, nu_in):
+            def run_ode(alphas_in, rhos_in, nus_in):
                 a_ts = PchipInterpolator(self.expiries, alphas_in, extrapolate=True)
                 r_ts = PchipInterpolator(self.expiries, rhos_in, extrapolate=True)
-                return self.rough_sabr_vol_ode(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), nu_in, H)
+                n_ts = PchipInterpolator(self.expiries, nus_in, extrapolate=True)
+                return self.rough_sabr_vol_ode(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), n_ts(self.T_flat), H)
 
             # Fast Polynomial Helper
-            def run_poly(alphas_in, rhos_in, nu_in):
+            def run_poly(alphas_in, rhos_in, nus_in):
                 a_ts = PchipInterpolator(self.expiries, alphas_in, extrapolate=True)
                 r_ts = PchipInterpolator(self.expiries, rhos_in, extrapolate=True)
-                return self.rough_sabr_vol(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), nu_in, H)
+                n_ts = PchipInterpolator(self.expiries, nus_in, extrapolate=True)
+                return self.rough_sabr_vol(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), n_ts(self.T_flat), H)
 
             if method == 'polynomial':
                 # For pure polynomial, alpha IS the market ATM
                 current_alphas = base_market_alphas.copy()
                 def obj_poly(p): 
-                    return (run_poly(current_alphas, p[:-1], p[-1]) - self.market_vols) * 10000.0
+                    return (run_poly(current_alphas, p[:self.n_exp], p[self.n_exp:]) - self.market_vols) * 10000.0
                 res = least_squares(obj_poly, guess, bounds=(low_bounds, high_bounds), method='trf')
                 rmse = np.sqrt(np.mean(res.fun**2))
                 current_p = res.x
@@ -322,7 +335,7 @@ class RoughSABRCalibrator:
                 # For pure ODE, alpha IS the market ATM
                 current_alphas = base_market_alphas.copy()
                 def obj_ode(p): 
-                    return (run_ode(current_alphas, p[:-1], p[-1]) - self.market_vols) * 10000.0
+                    return (run_ode(current_alphas, p[:self.n_exp], p[self.n_exp:]) - self.market_vols) * 10000.0
                 res = least_squares(obj_ode, guess, bounds=(low_bounds, high_bounds), method='trf')
                 rmse = np.sqrt(np.mean(res.fun**2))
                 current_p = res.x
@@ -332,7 +345,7 @@ class RoughSABRCalibrator:
                 # A. Base Predictor: Pre-optimize ODE to get excellent starting rhos and nu
                 current_alphas = base_market_alphas.copy()
                 def obj_ode(p): 
-                    return (run_ode(current_alphas, p[:-1], p[-1]) - self.market_vols) * 10000.0
+                    return (run_ode(current_alphas, p[:self.n_exp], p[self.n_exp:]) - self.market_vols) * 10000.0
                 res_ode = least_squares(obj_ode, guess, bounds=(low_bounds, high_bounds), method='trf')
                 current_p = res_ode.x
                 
@@ -342,15 +355,16 @@ class RoughSABRCalibrator:
                 
                 # B. AMMO Outer Loop (Option 1: Implicit Alpha)
                 for ammo_iter in range(3):
-                    rhos = current_p[:-1]
-                    nu_val = current_p[-1]
+                    rhos = current_p[:self.n_exp]
+                    nus = current_p[self.n_exp:]
                     
                     # Evaluate High-Fidelity (MC) and Low-Fidelity (ODE) at current state
                     a_ts = PchipInterpolator(self.expiries, current_alphas, extrapolate=True)
                     r_ts = PchipInterpolator(self.expiries, rhos, extrapolate=True)
+                    n_ts = PchipInterpolator(self.expiries, nus, extrapolate=True)
                     
-                    v_mc = self.rough_sabr_vol_mc(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), nu_val, H)
-                    v_ode = run_ode(current_alphas, rhos, nu_val)
+                    v_mc = self.rough_sabr_vol_mc(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), n_ts(self.T_flat), H)
+                    v_ode = run_ode(current_alphas, rhos, nus)
                     
                     # Record True Accuracy against the raw market
                     mc_rmse = np.sqrt(np.mean(((v_mc - self.market_vols)*10000.0)**2))
@@ -376,8 +390,8 @@ class RoughSABRCalibrator:
                     
                     # C. Inner Surrogate Optimization (Alphas are mathematically FIXED!)
                     def ammo_surrogate(p_inner):
-                        # p_inner only contains [rhos, nu], so dimensionality is low and fast
-                        v_surr = run_ode(current_alphas, p_inner[:-1], p_inner[-1]) + delta_k
+                        # p_inner contains [rhos, nus]
+                        v_surr = run_ode(current_alphas, p_inner[:self.n_exp], p_inner[self.n_exp:]) + delta_k
                         return (v_surr - self.market_vols) * 10000.0
 
                     res_surr = least_squares(
@@ -401,14 +415,14 @@ class RoughSABRCalibrator:
         total_time = time.time() - start_time_total
         print(f"\nStatus : SUCCESS")
         print(f"Global Hurst (H): {best_H:.6f}")
-        print(f"Global Nu       : {best_res_x[-1]:.4f}")
+        print(f"Mean Nu         : {np.mean(best_res_x[self.n_exp:]):.4f}")
         print(f"Best RMSE       : {best_rmse:.4f} bps")
         print(f"1D Calibration Total Time: {total_time:.2f}s")
         print("="*60)
         
         # Save finalized parameters
-        best_rhos = best_res_x[:-1]
-        best_nu = best_res_x[-1]
+        best_rhos = best_res_x[:self.n_exp]
+        best_nus = best_res_x[self.n_exp:]
         self.alpha_ts = PchipInterpolator(self.expiries, best_alpha_vals, extrapolate=True)
         
         return {
@@ -416,7 +430,7 @@ class RoughSABRCalibrator:
             'H': best_H, 
             'rmse_bps': best_rmse,
             'rho_func': PchipInterpolator(self.expiries, best_rhos, extrapolate=True),
-            'nu_func': PchipInterpolator(self.expiries, np.full(self.n_exp, best_nu), extrapolate=True)
+            'nu_func': PchipInterpolator(self.expiries, best_nus, extrapolate=True)
         }
             
 
@@ -431,10 +445,11 @@ class RoughSABRCalibrator:
         T_t = torch.tensor(T, device=device, dtype=torch.float64)
         alpha_t = torch.tensor(alpha, device=device, dtype=torch.float64)
         rho_t = torch.tensor(rho, device=device, dtype=torch.float64)
+        nu_t = torch.tensor(nu, device=device, dtype=torch.float64)
         
         # Run the massive PyTorch Monte Carlo engine
         mc_prices_t = mc_rough_bergomi_pricer(
-            K_t, T_t, alpha_t, rho_t, nu, H, 
+            K_t, T_t, alpha_t, rho_t, nu_t, H, 
             n_paths=16384, # high enough for optimizer stability, low enough for speed
             dt=1.0/24.0,   # roughly bi-weekly steps
             kappa_hybrid=1, 
@@ -492,13 +507,15 @@ class RoughSABRCalibrator:
 
         def _surrogate_obj(p_tensor):
             rhos = p_tensor[:self.n_exp]
-            nu_val = p_tensor[-1]
-            # Map the rhos exactly to the flattened grid without heavy interpolators
+            nus = p_tensor[self.n_exp:]
+            
+            # Map the parameters exactly to the flattened grid without heavy interpolators
             rho_mapped = rhos[self.t_indices]
+            nu_mapped = nus[self.t_indices]
             
             v_ode = self.rough_sabr_vol_ode_torch(
                 self.K_flat_t, self.T_flat_t, self.alpha_flat_t, 
-                rho_mapped, nu_val, H
+                rho_mapped, nu_mapped, H
             )
             return (v_ode - torch.tensor(self.market_vols, dtype=torch.float64)) * 10000.0
 
@@ -664,4 +681,3 @@ class CorrelationCalibrator:
             'omega_matrix': self.omega,
             'Sigma_matrix': Sigma_final.cpu().numpy()
         }
-    
