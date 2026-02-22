@@ -47,43 +47,81 @@ def run_martingale_test():
     # Under terminal measure Q^{T_N}, the asset P(t, T_j) / P(t, T_N) must be a martingale.
     # Z_t^j = P(t, T_j) / P(t, T_N) = prod_{k=j}^{N-1} (1 + tau_k * R_t^k)
     
-    step_idx = -1 # Evaluate at T = 5.0 Years
+    step_idx = -1  # Evaluate at the terminal simulation time (T = 5.0Y here)
+    eval_time = time_grid[step_idx].item()
+    start_idx = torch.searchsorted(
+        model.T,
+        torch.tensor(eval_time, device=device, dtype=model.dtype),
+        right=False,
+    ).item()
+
+
     tau = model.tau
     F0 = model.F0
     errors_bps = []
     
-    print("-" * 65)
-    print(f"{'Bond Ratio':<15} | {'Z_0 (Target)':<15} | {'E[Z_t] (Sim)':<15} | {'Leakage (bps)':<10}")
-    print("-" * 65)
+    invalid_stats = []
+
+    print("-" * 92)
+    print(
+        f"{'Bond Ratio':<19} | {'Z_0 (Target)':<15} | {'E[Z_t] (Sim)':<15} | {'Invalid Paths':<13} | {'Leakage (bps)':<12}"
+    )
+    print("-" * 92)
+
     
-    # We test the martingale property for bonds from 5Y to 29Y
-    for j in range(5, model.N): 
+    # We test the martingale property only for bonds with maturity >= eval_time
+    for j in range(start_idx, model.N):
+        maturity = model.T[j].item()  
         # True analytical Z_0
         Z_0_j = torch.prod(1.0 + tau[j:] * F0[j:]).item()
         
         # Simulated Z_t at t=5.0
         # F_paths shape: (n_paths, n_steps, N)
-        Z_t_paths = torch.prod(1.0 + tau[j:] * F_paths[:, step_idx, j:], dim=1)
-        E_Z_t_j = torch.mean(Z_t_paths).item()
-        
-        # Calculate the equivalent basis point error per forward rate
-        error_ratio = abs(E_Z_t_j - Z_0_j) / Z_0_j
-        time_to_maturity = torch.sum(tau[j:]).item()
-        error_bps = (error_ratio / time_to_maturity) * 10000.0 
-        errors_bps.append(error_bps)
-        
+        ratio_terms = 1.0 + tau[j:] * F_paths[:, step_idx, j:]
+
+        # Any non-positive term implies a bond-ratio sign/definition breakdown under simple compounding.
+        valid_mask = torch.all(torch.isfinite(ratio_terms) & (ratio_terms > 0.0), dim=1)
+        invalid_ratio = 1.0 - valid_mask.double().mean().item()
+        invalid_stats.append(invalid_ratio)
+
+        if valid_mask.any():
+            Z_t_paths = torch.prod(ratio_terms[valid_mask], dim=1)
+            E_Z_t_j = torch.mean(Z_t_paths).item()
+            error_ratio = abs(E_Z_t_j - Z_0_j) / Z_0_j
+            time_to_maturity = torch.sum(tau[j:]).item()
+            error_bps = (error_ratio / time_to_maturity) * 10000.0
+            errors_bps.append(error_bps)
+            ez_text = f"{E_Z_t_j:<15.6f}"
+            err_text = f"{error_bps:<12.4f}"
+        else:
+            ez_text = "N/A"
+            err_text = "N/A"
+
         # Print every 5 years to keep console clean
-        if j % 5 == 0 or j == model.N - 1: 
-            print(f"P(t,{j:02d}Y)/P(t,30Y) | {Z_0_j:<15.6f} | {E_Z_t_j:<15.6f} | {error_bps:<10.4f}")
-            
-    print("-" * 65)
-    max_err = max(errors_bps)
-    print(f"Maximum Arbitrage Leakage: {max_err:.4f} bps / rate")
-    if max_err < 0.5:
-        print("Status: PASS (Perfect Martingale Dynamics)")
+        if j % 5 == 0 or j == model.N - 1:
+            print(
+                f"P(t,{maturity:04.1f}Y)/P(t,30Y) | {Z_0_j:<15.6f} | {ez_text:<15} | {100.0*invalid_ratio:11.4f}% | {err_text}"
+            )
+
+    print("-" * 92)
+    if errors_bps:
+        max_err = max(errors_bps)
+        print(f"Maximum Arbitrage Leakage (valid paths only): {max_err:.4f} bps / rate")
     else:
-        print("Status: WARNING (Significant Euler Discretization Drift)")
+        max_err = float('inf')
+        print("Maximum Arbitrage Leakage: N/A (no valid paths)")
+
+    worst_invalid = max(invalid_stats) if invalid_stats else 1.0
+    print(f"Worst invalid-path ratio across maturities: {100.0*worst_invalid:.4f}%")
+
+    if worst_invalid > 1e-4:
+        print("Status: FAIL (Simulation produced non-positive bond-ratio factors: 1 + tau*F <= 0)")
+    elif max_err < 0.5:
+        print("Status: PASS (Martingale Dynamics within tolerance)")
+    else:
+        print("Status: WARNING (Significant discretization bias on valid paths)")
     print("=" * 65)
+
 
 
 def run_aad_vs_fd_test():
@@ -203,6 +241,9 @@ def run_extreme_regime_test():
     nu_f = lambda T: np.full_like(T, 2.50)      # Massive Vol-of-Vol (Standard is 0.4)
     H = 0.01                                    # Hyper-roughness (Near singularity)
     
+    print(f"[Setup] Device={device}, H={H}, nu={nu_f(np.array([0.0]))[0]:.2f}, n_tenors={len(F0_rates)}")
+    print(f"[Setup] Initial Forward Range: [{np.min(F0_rates)*10000:.2f}, {np.max(F0_rates)*10000:.2f}] bps")
+  
     # 2. Instantiate Model
     # Using 'full' mode with beta_decay=1e-5 creates a correlation matrix of ~0.999 
     # everywhere, severely stressing the Cholesky decomposition.
@@ -212,7 +253,13 @@ def run_extreme_regime_test():
             beta_decay=1e-5, beta_sabr=0.5, shift=0.03, 
             correlation_mode='full', device=device
         )
-        cholesky_status = "PASS"
+        Sigma_rates = model.loadings[1:, :] @ model.loadings[1:, :].T
+        eigvals = torch.linalg.eigvalsh(Sigma_rates)
+        min_eig = torch.min(eigvals).item()
+        max_eig = torch.max(eigvals).item()
+        cond_num = (max_eig / max(min_eig, 1e-16))
+        cholesky_status = f"PASS (min_eig={min_eig:.3e}, cond~{cond_num:.3e})"
+
     except Exception as e:
         cholesky_status = f"FAIL ({str(e)})"
         
@@ -233,7 +280,17 @@ def run_extreme_regime_test():
         elif torch.isinf(F_paths).any():
             mc_status = "FAIL (Infinities detected in paths)"
         else:
-            mc_status = "PASS"
+            F_terminal = F_paths[:, -1, :]
+            min_term = torch.min(F_terminal).item()
+            max_term = torch.max(F_terminal).item()
+            q01 = torch.quantile(F_terminal.reshape(-1), 0.01).item()
+            q99 = torch.quantile(F_terminal.reshape(-1), 0.99).item()
+            invalid_simple = torch.mean((1.0 + model.tau.view(1, -1) * F_terminal <= 0.0).double()).item()
+            mc_status = (
+                f"PASS (terminal F in [{min_term*10000:.1f}, {max_term*10000:.1f}] bps, "
+                f"q01/q99=[{q01*10000:.1f}, {q99*10000:.1f}] bps, "
+                f"1+tau*F<=0 rate={100.0*invalid_simple:.4f}%)"
+            )
     except Exception as e:
         mc_status = f"FAIL ({str(e)})"
 
@@ -254,7 +311,9 @@ def run_extreme_regime_test():
         elif torch.isinf(v_ode).any():
             ode_status = "FAIL (Infinities detected in ODE)"
         else:
-            ode_status = f"PASS (ODE Vol: {v_ode.item()*10000:.2f} bps)"
+            ode_vol_bps = v_ode.item() * 10000
+            ode_status = f"PASS (ODE Vol={ode_vol_bps:.2f} bps, shape={tuple(v_ode.shape)})"
+
     except Exception as e:
         ode_status = f"FAIL ({str(e)})"
         
@@ -308,7 +367,15 @@ def run_put_call_parity_test():
     A0 = torch.sum(model.tau[idx_ex:idx_end] * P0[idx_ex+1:idx_end+1])
     ATM_strike = ((P0[idx_ex] - P0[idx_end]) / A0).item()
     
-    print(f"[Setup] Testing 5Yx5Y European Swaption (ATM Strike: {ATM_strike*10000:.2f} bps)")
+    # For parity diagnostics, avoid forcing a fair strike from the same Monte Carlo sample,
+    # which makes payer and receiver mechanically symmetric and can mask issues.
+    # Use a fixed off-ATM strike so the forward leg is generally non-zero.
+    strike_offset_bps = 50.0
+    test_strike = ATM_strike + strike_offset_bps / 10000.0
+
+    print(f"[Setup] 5Yx5Y European Swaption ATM Strike:  {ATM_strike*10000:.2f} bps")
+    print(f"[Setup] 5Yx5Y European Swaption Test Strike: {test_strike*10000:.2f} bps (+{strike_offset_bps:.0f} bps)")
+
     
     # 3. Simulate Paths to Expiry
     n_paths = 65536
@@ -329,13 +396,9 @@ def run_put_call_parity_test():
         annuity_part = torch.sum(dfs_full[:, :idx_end-idx_ex] * taus_swap, dim=1)
         float_part = torch.sum(dfs_full[:, :idx_end-idx_ex] * F_T_full[:, :idx_end-idx_ex] * taus_swap, dim=1)
         
-        # The Fair Strike that makes the Forward Swap PV = 0 in this specific measure:
-        ATM_strike_fair = (torch.mean(float_part / p_t_Tn) / torch.mean(annuity_part / p_t_Tn)).item()
-        
-        print(f"[Setup] Testing 5Yx5Y European Swaption (Fair Strike: {ATM_strike_fair*10000:.2f} bps)")
+         # Test parity at a fixed strike (not fair-strike re-centered)
+        swap_val = float_part - test_strike * annuity_part
 
-        # Re-calculate payoffs with the Fair Strike
-        swap_val = float_part - ATM_strike_fair * annuity_part
         
         payer_deflated = torch.mean(torch.clamp(swap_val, min=0.0) / p_t_Tn)
         receiver_deflated = torch.mean(torch.clamp(-swap_val, min=0.0) / p_t_Tn)
@@ -358,7 +421,7 @@ def run_put_call_parity_test():
     print(f"{'Simulated Forward Swap PV':<30} | {forward_swap_price:15.6f}")
     print("-" * 65)
     
-    parity_error = abs(payer_price - receiver_price)
+    parity_error = abs((payer_price - receiver_price) - forward_swap_price)
     print(f"Put-Call Parity Error: {parity_error:.6f} bps")
     
     if parity_error < 0.1:
@@ -373,3 +436,4 @@ if __name__ == '__main__':
     run_aad_vs_fd_test()
     run_extreme_regime_test()
     run_put_call_parity_test()
+
