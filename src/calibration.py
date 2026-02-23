@@ -11,15 +11,9 @@ import time
 import pandas as pd
 
 
-
 def mc_rough_bergomi_pricer(K_flat, T_flat, alpha_flat, rho_flat, nu_in, H, n_paths=(32768/2), dt=1.0/50.0, kappa_hybrid=1, device='cpu'):
-    """
-    Ultra-fast PyTorch Monte Carlo Engine for 1D Rough Bergomi pricing.
-    Uses the Bennedsen Hybrid Scheme and Bachelier Control Variates for massive variance reduction.
-    """
     dtype = torch.float64
     
-    # Safely handle 'nu_in' whether it's passed as a scalar float or a full tensor array
     if not isinstance(nu_in, torch.Tensor):
         nu_tensor = torch.tensor(nu_in, device=device, dtype=dtype)
     else:
@@ -28,12 +22,10 @@ def mc_rough_bergomi_pricer(K_flat, T_flat, alpha_flat, rho_flat, nu_in, H, n_pa
     if nu_tensor.dim() == 0:
         nu_tensor = nu_tensor.expand(len(T_flat))
     
-    # 1. Setup Time Grid (simulate once up to the longest expiry)
     max_T = float(torch.max(T_flat))
     n_steps = int(math.ceil(max_T / dt))
     dt_tensor = torch.tensor(dt, dtype=dtype, device=device)
     
-    # 2. Vectorized Hybrid Scheme Kernel (Bennedsen et al. 2017)
     H_tensor = torch.tensor(H, dtype=dtype, device=device)
     gamma_const = torch.exp(torch.lgamma(H_tensor + 0.5))
     alpha_H = H - 0.5
@@ -41,14 +33,12 @@ def mc_rough_bergomi_pricer(K_flat, T_flat, alpha_flat, rho_flat, nu_in, H, n_pa
     k_mat = torch.clamp(diag_idx[:, None] - diag_idx[None, :] + 1, min=0.0).to(dtype)
     
     exact_weights = (torch.pow(k_mat, alpha_H + 1.0) - torch.pow(torch.clamp(k_mat - 1.0, min=0.0), alpha_H + 1.0)) / (alpha_H + 1.0)
-    weights = torch.where(k_mat <= kappa_hybrid, exact_weights, exact_weights) # optimal evaluation
+    weights = torch.where(k_mat <= kappa_hybrid, exact_weights, exact_weights) 
     kernel = weights * torch.pow(dt_tensor, alpha_H) / gamma_const
     
-    # Zero-out upper triangle for causality
     t_idx, s_idx = diag_idx[:, None], diag_idx[None, :]
     kernel = torch.where(t_idx >= s_idx, kernel, torch.tensor(0.0, dtype=dtype, device=device))
     
-    # 3. Sobol Random Draws (Anti-thetic / Scrambled)
     sobol = torch.quasirandom.SobolEngine(dimension=n_steps * 2, scramble=True, seed=42)
     u = sobol.draw(n_paths).to(device).to(dtype)
     dist = Normal(torch.tensor(0.0, device=device, dtype=dtype), torch.tensor(1.0, device=device, dtype=dtype))
@@ -57,14 +47,11 @@ def mc_rough_bergomi_pricer(K_flat, T_flat, alpha_flat, rho_flat, nu_in, H, n_pa
     dz_vol = z[..., 0] * torch.sqrt(dt_tensor)
     dz_perp = z[..., 1] * torch.sqrt(dt_tensor)
     
-    # 4. Global Volatility Process Generation Base
     fbm = torch.matmul(dz_vol, kernel.T)
     
-    # Pre-map expiries to step indices
     step_indices = torch.clamp(torch.round(T_flat / dt).long() - 1, 0, n_steps - 1)
     prices = torch.zeros(len(T_flat), dtype=dtype, device=device)
     
-    # 5. Fast Pricing Loop with Control Variates
     for i in range(len(T_flat)):
         idx = step_indices[i]
         a = alpha_flat[i]
@@ -73,41 +60,30 @@ def mc_rough_bergomi_pricer(K_flat, T_flat, alpha_flat, rho_flat, nu_in, H, n_pa
         T = T_flat[i]
         n_i = nu_tensor[i]
         
-        # Variance compensator and unit vols using THIS expiry's nu parameter
         var_comp = 0.5 * (n_i**2) * torch.sum(kernel**2, dim=1) * dt
         unit_vols = torch.exp(n_i * fbm - var_comp.unsqueeze(0))
         
-        # SHIFT volatility by 1 step to make it predictable (Euler-Maruyama strict adherence)
-        # This prevents forward leakage and the massive spurious negative drift.
         unit_vols_shifted = torch.cat([torch.ones(n_paths, 1, device=device, dtype=dtype), unit_vols[:, :-1]], dim=1)
-        
-        # Spot process correlated shocks
         dz_spot = r * dz_vol[:, :idx+1] + torch.sqrt(1.0 - r**2) * dz_perp[:, :idx+1]
         
-        # Target Path: Rough Bergomi (Normal / Bachelier scaling)
         vol_path = unit_vols_shifted[:, :idx+1]
         dS = a * vol_path * dz_spot
         S_T = torch.sum(dS, dim=1)
         
-        # Shadow Path: Standard Bachelier (Constant Volatility)
         dS_cv = a * dz_spot
         S_T_cv = torch.sum(dS_cv, dim=1)
         
-        # Call Payoffs
         payoff_rb = torch.clamp(S_T - k, min=0.0)
         payoff_cv = torch.clamp(S_T_cv - k, min=0.0)
         
-        # True Analytical Control Variate Price (Bachelier)
         std = a * torch.sqrt(T)
         d = -k / std if std > 1e-12 else torch.tensor(0.0, device=device, dtype=dtype)
         true_cv_price = std * (dist.cdf(d) * d + torch.exp(dist.log_prob(d)))
         
-        # Dynamic Beta calculation for Variance Reduction
         cov = torch.mean((payoff_rb - torch.mean(payoff_rb)) * (payoff_cv - torch.mean(payoff_cv)))
         var = torch.var(payoff_cv)
         beta = cov / var if var > 1e-12 else 0.0
         
-        # Final noise-reduced MC Price
         mc_price = torch.mean(payoff_rb - beta * (payoff_cv - true_cv_price))
         prices[i] = mc_price
         
@@ -115,40 +91,30 @@ def mc_rough_bergomi_pricer(K_flat, T_flat, alpha_flat, rho_flat, nu_in, H, n_pa
 
 
 def bachelier_iv_newton(target_prices, K, T, initial_guess_vol, max_iter=20, tol=1e-8):
-    """
-    Vectorized Newton-Raphson root finder to invert Bachelier prices to Normal Implied Volatility.
-    """
     k = np.array(K)
-    # Safeguard: Option price MUST be >= Intrinsic value, otherwise IV is mathematically undefined.
-    # Prevents Newton solver from diverging to infinity if MC noise pushes price slightly too low.
     intrinsic = np.maximum(-k, 0.0)
     P = np.maximum(np.array(target_prices), intrinsic + 1e-12)
     t = np.array(T)
-    sigma = np.array(initial_guess_vol) # starting guess (typically the base alpha)
+    sigma = np.array(initial_guess_vol)
     
     sqrt_t = np.sqrt(t)
     
     for _ in range(max_iter):
         std = sigma * sqrt_t
-        # Guard against division by zero
         std = np.where(std < 1e-12, 1e-12, std)
         d = -k / std
         
-        # Calculate Bachelier Price with current sigma
         pdf = norm.pdf(d)
         cdf = norm.cdf(d)
         price_current = std * (d * cdf + pdf)
         
-        # Calculate Bachelier Vega
         vega = sqrt_t * pdf
         vega = np.where(vega < 1e-12, 1e-12, vega)
         
-        # Newton-Raphson step
         diff = price_current - P
         step = diff / vega
         sigma = sigma - step
         
-        # Break early if all points converge
         if np.max(np.abs(diff)) < tol:
             break
             
@@ -158,148 +124,68 @@ def bachelier_iv_newton(target_prices, K, T, initial_guess_vol, max_iter=20, tol
 class RoughSABRCalibrator:
     def __init__(self, vol_matrix):
         self.vol_matrix = vol_matrix
-        # Ensure expiries and strikes are floats for math operations
         self.expiries = self.vol_matrix.index.values.astype(float)
         self.strike_offsets = self.vol_matrix.columns.values.astype(float)
         self.n_exp = len(self.expiries)
         
-        # Pre-calculate ATM Term Structure: alpha(T)
         atm_idx = np.argmin(np.abs(self.strike_offsets))
         self.alpha_ts = PchipInterpolator(self.expiries, self.vol_matrix.iloc[:, atm_idx].values, extrapolate=True)
         
-        # Flatten market data for the global optimizer
         self.market_vols = self.vol_matrix.values.flatten()
         T_grid, K_grid = np.meshgrid(self.expiries, self.strike_offsets, indexing='ij')
         self.T_flat, self.K_flat = T_grid.flatten(), K_grid.flatten()
         
-        # Clean out NaNs if any exist in the market data
         valid = ~np.isnan(self.market_vols)
         self.market_vols = self.market_vols[valid]
         self.T_flat = self.T_flat[valid]
         self.K_flat = self.K_flat[valid]
 
-        # --- NEW AMMO CODE: Pre-computations for the PyTorch Jacobian ---
-        # Map each point in the flattened grid directly to its expiry index
-        self.t_indices = torch.tensor([np.where(self.expiries == t)[0][0] for t in self.T_flat], dtype=torch.long)
-        self.K_flat_t = torch.tensor(self.K_flat, dtype=torch.float64)
-        self.T_flat_t = torch.tensor(self.T_flat, dtype=torch.float64)
-        self.alpha_flat_t = torch.tensor(self.alpha_ts(self.T_flat), dtype=torch.float64)
 
-
-    def rough_sabr_vol(self, k, T, alpha, rho, nu, H):
-        """ Core Rough SABR asymptotic expansion formula """
-        # Skew term scales with T^(H-0.5)
-        skew = (rho * nu) / (2.0 * alpha * (H + 0.5)) * k * (T**(H - 0.5))
-        # Smile term scales with T^(2H-1)
-        smile = (2.0 - 3.0*rho**2)/24.0 * (nu/alpha)**2 * (k**2) * (T**(2.0*H - 1.0))
-        # ATM Drift scales with T^(2H)
-        drift = (2.0 - 3.0*rho**2)/24.0 * nu**2 * (T**(2.0*H))
-        
-        return alpha * (1.0 + skew + smile + drift)
+    def exact_atm_alpha(self, T, target_atm_vol, rho, nu, H):
+        c_H = 1.0 / (np.sqrt(2.0 * H) * math.gamma(H + 0.5))
+        nu_eff = nu * c_H
+        drift = (2.0 - 3.0*rho**2) / 24.0 * nu_eff**2 * (T**(2.0*H))
+        return target_atm_vol / (1.0 + drift)
 
 
     def rough_sabr_vol_ode(self, k, T, alpha, rho, nu, H):
-        """ 
-        Advanced Rough SABR closed-form approximation using the ODE solution 
-        from Fukasawa & Gatheral (2022).
-        """
-        # Calculate the scaled moneyness y
-        y = (nu * (T**(H - 0.5)) * k) / alpha
+        c_H = 1.0 / (np.sqrt(2.0 * H) * math.gamma(H + 0.5))
+        nu_eff = nu * c_H
         
-        # Clip rho for numerical stability in log and arctan operations
-        rho_safe = np.clip(rho, -0.9999, 0.9999)
+        A = (rho * nu_eff) / (H + 0.5) * (T**(H - 0.5))
+        B = (2.0 - 3.0 * rho**2) * (nu_eff**2) * (T**(2.0*H - 1.0))
         
-        def G_half(z):
-            inner = np.sqrt(1.0 + rho_safe * z + z**2 / 4.0) - rho_safe - z / 2.0
-            return 4.0 * (np.log(inner / (1.0 - rho_safe)))**2
-            
-        def G_zero(z):
-            term1 = np.log(1.0 + 2.0 * rho_safe * z + z**2)
-            denom = np.sqrt(1.0 - rho_safe**2)
-            term2 = (2.0 * rho_safe / denom) * (np.arctan(rho_safe / denom) - np.arctan((z + rho_safe) / denom))
-            return term1 + term2
-
-        # Avoid division by zero at exactly ATM (k=0)
-        safe_y = np.where(np.abs(y) < 1e-12, 1e-12, y)
+        nu_cl = np.sqrt(np.maximum((B + 3.0 * A**2) / 2.0, 1e-12))
+        rho_cl = np.clip(A / nu_cl, -0.9999, 0.9999)
         
-        z0 = safe_y / (2.0 * H + 1.0)
-        z_half = 2.0 * safe_y / (2.0 * H + 1.0)
+        z_cl = (nu_cl / alpha) * k
+        sq_arg = np.maximum(1.0 - 2.0 * rho_cl * z_cl + z_cl**2, 1e-10)
+        inner = np.sqrt(sq_arg) + z_cl - rho_cl
         
-        w0 = 3.0 * (1.0 - 2.0 * H) / (2.0 * H + 3.0)
-        w_half = 2.0 * H / (2.0 * H + 3.0)
+        log_arg = np.maximum(inner / (1.0 - rho_cl), 1e-10)
+        x_z = np.log(log_arg)
         
-        # Interpolate between H=0 and H=1/2 extreme solutions
-        G_A = ((2.0 * H + 1.0)**2) * (w0 * G_zero(z0) + w_half * G_half(z_half))
+        safe_x_z = np.where(np.abs(x_z) < 1e-8, 1e-8, x_z)
+        ratio = np.where(np.abs(z_cl) < 1e-8, 1.0, z_cl / safe_x_z)
+        drift = (2.0 - 3.0 * rho**2) / 24.0 * (nu_eff**2) * (T**(2.0*H))
         
-        # Prevent floating-point negatives and division-by-zero
-        G_A_safe = np.clip(G_A, a_min=1e-14, a_max=None)
-        
-        # The limit of |y|/sqrt(G_A) as y -> 0 is 1.0
-        ratio = np.where(np.abs(y) < 1e-12, 1.0, np.abs(safe_y) / np.sqrt(G_A_safe))
-
-        
-        return alpha * ratio
-
-
-    def _obj(self, p, H, method):
-        # Unpack params: [rho_1...rho_n, nu_1...nu_n]
-        rhos, nus = p[:self.n_exp], p[self.n_exp:]
-        
-        # Interpolate rho(T) and nu(T) term structures
-        r_ts = PchipInterpolator(self.expiries, rhos, extrapolate=True)
-        n_ts = PchipInterpolator(self.expiries, nus, extrapolate=True)
-        
-        # Select the pricing method
-        if method == 'polynomial':
-            v = self.rough_sabr_vol(
-                self.K_flat, self.T_flat, 
-                self.alpha_ts(self.T_flat), 
-                r_ts(self.T_flat), 
-                n_ts(self.T_flat), 
-                H
-            )
-        elif method == 'ODE':
-            v = self.rough_sabr_vol_ode(
-                self.K_flat, self.T_flat, 
-                self.alpha_ts(self.T_flat), 
-                r_ts(self.T_flat), 
-                n_ts(self.T_flat), 
-                H
-            )
-        elif method == 'MC':
-            v = self.rough_sabr_vol_mc(
-                self.K_flat, self.T_flat, 
-                self.alpha_ts(self.T_flat), 
-                r_ts(self.T_flat), 
-                n_ts(self.T_flat), 
-                H
-            )
-        else:
-            raise ValueError(f"Unknown calibration method: {method}")
-            
-        return (v - self.market_vols) * 10000.0
+        return alpha * ratio * (1.0 + drift)
 
 
     def calibrate(self, method='MC', H_grid=np.array([0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50])):
         import time
         print("\n" + "="*60)
-        print(f"{f'ROUGH SABR 1D CALIBRATION (TERM STRUCTURE NU | {method.upper()})':^60}")
+        print(f"{f'ROUGH SABR 1D CALIBRATION (MAPPED NORMAL SURROGATE | {method.upper()})':^60}")
         print("="*60)
         
         best_rmse = np.inf
         best_H = None
-        best_res_x = None
-        best_alpha_vals = None
+        best_alphas = None
+        best_rhos = None
+        best_nus = None
         
-        # 1. Isolate ATM market data for exact explicit matching
         atm_idx = np.argmin(np.abs(self.strike_offsets))
-        atm_val_strike = self.strike_offsets[atm_idx]
         base_market_alphas = self.vol_matrix.iloc[:, atm_idx].values.copy()
-        
-        # 2. FULL PARAMETER SPACE: [rhos (n_exp), nus (n_exp)]
-        guess = np.concatenate([np.full(self.n_exp, -0.1), np.full(self.n_exp, 0.4)])
-        low_bounds = np.concatenate([np.full(self.n_exp, -0.99), np.full(self.n_exp, 0.001)])
-        high_bounds = np.concatenate([np.full(self.n_exp, 0.99), np.full(self.n_exp, 5.0)])
         
         start_time_total = time.time()
         
@@ -307,101 +193,94 @@ class RoughSABRCalibrator:
             step_start_time = time.time()
             print(f"Grid {i+1:2d}/{len(H_grid)} | Testing Hurst (H) = {H:.3f} | ", end="", flush=True)
             
-            # Fast ODE Helper (alphas are now passed externally)
-            def run_ode(alphas_in, rhos_in, nus_in):
-                a_ts = PchipInterpolator(self.expiries, alphas_in, extrapolate=True)
-                r_ts = PchipInterpolator(self.expiries, rhos_in, extrapolate=True)
-                n_ts = PchipInterpolator(self.expiries, nus_in, extrapolate=True)
-                return self.rough_sabr_vol_ode(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), n_ts(self.T_flat), H)
-
-            # Fast Polynomial Helper
-            def run_poly(alphas_in, rhos_in, nus_in):
-                a_ts = PchipInterpolator(self.expiries, alphas_in, extrapolate=True)
-                r_ts = PchipInterpolator(self.expiries, rhos_in, extrapolate=True)
-                n_ts = PchipInterpolator(self.expiries, nus_in, extrapolate=True)
-                return self.rough_sabr_vol(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), n_ts(self.T_flat), H)
-
-            if method == 'polynomial':
-                # For pure polynomial, alpha IS the market ATM
-                current_alphas = base_market_alphas.copy()
-                def obj_poly(p): 
-                    return (run_poly(current_alphas, p[:self.n_exp], p[self.n_exp:]) - self.market_vols) * 10000.0
-                res = least_squares(obj_poly, guess, bounds=(low_bounds, high_bounds), method='trf')
-                rmse = np.sqrt(np.mean(res.fun**2))
-                current_p = res.x
-                final_alphas = current_alphas
-
-            elif method == 'ODE':
-                # For pure ODE, alpha IS the market ATM
-                current_alphas = base_market_alphas.copy()
-                def obj_ode(p): 
-                    return (run_ode(current_alphas, p[:self.n_exp], p[self.n_exp:]) - self.market_vols) * 10000.0
-                res = least_squares(obj_ode, guess, bounds=(low_bounds, high_bounds), method='trf')
-                rmse = np.sqrt(np.mean(res.fun**2))
-                current_p = res.x
-                final_alphas = current_alphas
+            current_alphas = np.zeros(self.n_exp)
+            current_rhos = np.zeros(self.n_exp)
+            current_nus = np.zeros(self.n_exp)
             
-            elif method == 'MC':
-                # A. Base Predictor: Pre-optimize ODE to get excellent starting rhos and nu
-                current_alphas = base_market_alphas.copy()
-                def obj_ode(p): 
-                    return (run_ode(current_alphas, p[:self.n_exp], p[self.n_exp:]) - self.market_vols) * 10000.0
-                res_ode = least_squares(obj_ode, guess, bounds=(low_bounds, high_bounds), method='trf')
-                current_p = res_ode.x
+            # --- STEP 1: PRE-OPTIMIZATION ---
+            for j, exp_t in enumerate(self.expiries):
+                mask = np.abs(self.T_flat - exp_t) < 1e-6
+                k_targets = self.K_flat[mask]
+                v_targets = self.market_vols[mask]
                 
-                best_mc_rmse = np.inf
-                best_mc_p = current_p.copy()
-                best_mc_alphas = current_alphas.copy()
+                base_a = base_market_alphas[j]
+                guess = [-0.1, 0.4] 
+                bounds = ([-0.999, 0.001], [0.999, 10.0])
                 
-                # B. AMMO Outer Loop (Option 1: Implicit Alpha)
-                for ammo_iter in range(3):
-                    rhos = current_p[:self.n_exp]
-                    nus = current_p[self.n_exp:]
+                def slice_obj(p):
+                    rho, nu = p[0], p[1]
+                    alpha = self.exact_atm_alpha(exp_t, base_a, rho, nu, H)
+                    v = self.rough_sabr_vol_ode(k_targets, np.full_like(k_targets, exp_t), alpha, rho, nu, H)
+                    return (v - v_targets) * 10000.0
                     
-                    # Evaluate High-Fidelity (MC) and Low-Fidelity (ODE) at current state
+                res = least_squares(slice_obj, guess, bounds=bounds, method='trf')
+                current_rhos[j] = res.x[0]
+                current_nus[j] = res.x[1]
+                current_alphas[j] = self.exact_atm_alpha(exp_t, base_a, current_rhos[j], current_nus[j], H)
+            
+            if method != 'MC':
+                a_ts = PchipInterpolator(self.expiries, current_alphas, extrapolate=True)
+                r_ts = PchipInterpolator(self.expiries, current_rhos, extrapolate=True)
+                n_ts = PchipInterpolator(self.expiries, current_nus, extrapolate=True)
+                
+                v_full = self.rough_sabr_vol_ode(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), n_ts(self.T_flat), H)
+                rmse = np.sqrt(np.mean(((v_full - self.market_vols)*10000.0)**2))
+
+            # --- STEP 2: AMMO LOOP ---
+            if method == 'MC':
+                best_mc_rmse = np.inf
+                best_slice_alphas = current_alphas.copy()
+                best_slice_rhos = current_rhos.copy()
+                best_slice_nus = current_nus.copy()
+                
+                for ammo_iter in range(3):
                     a_ts = PchipInterpolator(self.expiries, current_alphas, extrapolate=True)
-                    r_ts = PchipInterpolator(self.expiries, rhos, extrapolate=True)
-                    n_ts = PchipInterpolator(self.expiries, nus, extrapolate=True)
+                    r_ts = PchipInterpolator(self.expiries, current_rhos, extrapolate=True)
+                    n_ts = PchipInterpolator(self.expiries, current_nus, extrapolate=True)
                     
                     v_mc = self.rough_sabr_vol_mc(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), n_ts(self.T_flat), H)
-                    v_ode = run_ode(current_alphas, rhos, nus)
+                    v_ode = self.rough_sabr_vol_ode(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), n_ts(self.T_flat), H)
                     
-                    # Record True Accuracy against the raw market
                     mc_rmse = np.sqrt(np.mean(((v_mc - self.market_vols)*10000.0)**2))
                     if mc_rmse < best_mc_rmse:
                         best_mc_rmse = mc_rmse
-                        best_mc_p = current_p.copy()
-                        best_mc_alphas = current_alphas.copy()
+                        best_slice_alphas = current_alphas.copy()
+                        best_slice_rhos = current_rhos.copy()
+                        best_slice_nus = current_nus.copy()
                         
-                    # Calculate the exact AMMO convexity defect
-                    delta_k = v_mc - v_ode
+                    delta_k_full = v_mc - v_ode
                     
-                    # IMPLICIT ALPHA UPDATE: 
-                    # Shift alphas perfectly by the ATM defect so Surrogate(ATM) = Market_ATM exactly
-                    atm_defects = np.zeros(self.n_exp)
-                    for exp_idx, exp_t in enumerate(self.expiries):
-                        idx_mask = (np.abs(self.T_flat - exp_t) < 1e-6) & (np.abs(self.K_flat - atm_val_strike) < 1e-6)
-                        if np.any(idx_mask):
-                            idx = np.where(idx_mask)[0][0]
-                            atm_defects[exp_idx] = delta_k[idx]
+                    for j, exp_t in enumerate(self.expiries):
+                        mask = np.abs(self.T_flat - exp_t) < 1e-6
+                        k_targets = self.K_flat[mask]
+                        v_targets = self.market_vols[mask]
+                        dk_targets = delta_k_full[mask]
+                        
+                        base_a = base_market_alphas[j]
+                        
+                        atm_mask = (np.abs(k_targets) < 1e-6)
+                        dk_atm = dk_targets[atm_mask][0] if np.any(atm_mask) else 0.0
+                        
+                        target_atm = base_a - dk_atm
+                        
+                        guess = [current_rhos[j], current_nus[j]]
+                        bounds = ([-0.999, 0.001], [0.999, 10.0])
+                        
+                        def ammo_slice(p):
+                            rho, nu = p[0], p[1]
+                            alpha = self.exact_atm_alpha(exp_t, target_atm, rho, nu, H)
+                            v_surr = self.rough_sabr_vol_ode(k_targets, np.full_like(k_targets, exp_t), alpha, rho, nu, H)
+                            return (v_surr + dk_targets - v_targets) * 10000.0
                             
-                    # The new locked alphas for the inner loop
-                    current_alphas = base_market_alphas - atm_defects
-                    
-                    # C. Inner Surrogate Optimization (Alphas are mathematically FIXED!)
-                    def ammo_surrogate(p_inner):
-                        # p_inner contains [rhos, nus]
-                        v_surr = run_ode(current_alphas, p_inner[:self.n_exp], p_inner[self.n_exp:]) + delta_k
-                        return (v_surr - self.market_vols) * 10000.0
-
-                    res_surr = least_squares(
-                        ammo_surrogate, current_p, bounds=(low_bounds, high_bounds), method='trf'
-                    )
-                    current_p = res_surr.x
-                
+                        res = least_squares(ammo_slice, guess, bounds=bounds, method='trf')
+                        current_rhos[j] = res.x[0]
+                        current_nus[j] = res.x[1]
+                        current_alphas[j] = self.exact_atm_alpha(exp_t, target_atm, current_rhos[j], current_nus[j], H)
+                        
                 rmse = best_mc_rmse
-                current_p = best_mc_p
-                final_alphas = best_mc_alphas
+                current_alphas = best_slice_alphas
+                current_rhos = best_slice_rhos
+                current_nus = best_slice_nus
 
             step_time = time.time() - step_start_time
             print(f"Done! RMSE: {rmse:6.2f} bps | Time: {step_time:5.2f}s")
@@ -409,21 +288,19 @@ class RoughSABRCalibrator:
             if rmse < best_rmse:
                 best_rmse = rmse
                 best_H = H
-                best_res_x = current_p
-                best_alpha_vals = final_alphas
+                best_alphas = current_alphas.copy()
+                best_rhos = current_rhos.copy()
+                best_nus = current_nus.copy()
                 
         total_time = time.time() - start_time_total
         print(f"\nStatus : SUCCESS")
         print(f"Global Hurst (H): {best_H:.6f}")
-        print(f"Mean Nu         : {np.mean(best_res_x[self.n_exp:]):.4f}")
+        print(f"Mean Nu         : {np.mean(best_nus):.4f}")
         print(f"Best RMSE       : {best_rmse:.4f} bps")
         print(f"1D Calibration Total Time: {total_time:.2f}s")
         print("="*60)
         
-        # Save finalized parameters
-        best_rhos = best_res_x[:self.n_exp]
-        best_nus = best_res_x[self.n_exp:]
-        self.alpha_ts = PchipInterpolator(self.expiries, best_alpha_vals, extrapolate=True)
+        self.alpha_ts = PchipInterpolator(self.expiries, best_alphas, extrapolate=True)
         
         return {
             'alpha_func': self.alpha_ts, 
@@ -435,11 +312,6 @@ class RoughSABRCalibrator:
             
 
     def rough_sabr_vol_mc(self, k, T, alpha, rho, nu, H):
-        """ 
-        True Adachi et al. (2025) calibration mapping. 
-        Uses the 1D Rough Bergomi PyTorch engine and inverts to Bachelier IV.
-        """
-        # Convert numpy arrays to torch tensors for the engine
         device = 'cpu'
         K_t = torch.tensor(k, device=device, dtype=torch.float64)
         T_t = torch.tensor(T, device=device, dtype=torch.float64)
@@ -447,97 +319,27 @@ class RoughSABRCalibrator:
         rho_t = torch.tensor(rho, device=device, dtype=torch.float64)
         nu_t = torch.tensor(nu, device=device, dtype=torch.float64)
         
-        # Run the massive PyTorch Monte Carlo engine
         mc_prices_t = mc_rough_bergomi_pricer(
             K_t, T_t, alpha_t, rho_t, nu_t, H, 
-            n_paths=16384, # high enough for optimizer stability, low enough for speed
-            dt=1.0/24.0,   # roughly bi-weekly steps
+            n_paths=16384, 
+            dt=1.0/24.0, 
             kappa_hybrid=1, 
             device=device
         )
         
-        # Bring prices back to CPU numpy
         mc_prices = mc_prices_t.cpu().numpy()
-        
-        # Invert prices back to Implied Volatility
         ivs = bachelier_iv_newton(mc_prices, k, T, initial_guess_vol=alpha)
         
         return ivs
     
-    
-    def rough_sabr_vol_ode_torch(self, k, T, alpha, rho, nu, H):
-        """ Pure PyTorch version of the ODE solution for AMMO Autograd """
-        y = (nu * (T**(H - 0.5)) * k) / alpha
-        rho_safe = torch.clamp(rho, -0.9999, 0.9999)
-        
-        def G_half(z):
-            inner = torch.sqrt(1.0 + rho_safe * z + z**2 / 4.0) - rho_safe - z / 2.0
-            return 4.0 * (torch.log(inner / (1.0 - rho_safe)))**2
-            
-        def G_zero(z):
-            term1 = torch.log(1.0 + 2.0 * rho_safe * z + z**2)
-            denom = torch.sqrt(1.0 - rho_safe**2)
-            term2 = (2.0 * rho_safe / denom) * (torch.atan(rho_safe / denom) - torch.atan((z + rho_safe) / denom))
-            return term1 + term2
-
-        safe_y = torch.where(torch.abs(y) < 1e-12, torch.tensor(1e-12, dtype=y.dtype, device=y.device), y)
-        
-        z0 = safe_y / (2.0 * H + 1.0)
-        z_half = 2.0 * safe_y / (2.0 * H + 1.0)
-        
-        w0 = 3.0 * (1.0 - 2.0 * H) / (2.0 * H + 3.0)
-        w_half = 2.0 * H / (2.0 * H + 3.0)
-        
-        G_A = ((2.0 * H + 1.0)**2) * (w0 * G_zero(z0) + w_half * G_half(z_half))
-        G_A_safe = torch.clamp(G_A, min=1e-14)
-        
-        ratio = torch.where(torch.abs(y) < 1e-12, torch.tensor(1.0, dtype=y.dtype, device=y.device), torch.abs(safe_y) / torch.sqrt(G_A_safe))
-        
-        return alpha * ratio
-    
-
-    def _get_ammo_jacobian(self, p, H, method):
-        """
-        The AMMO Surrogate Jacobian.
-        Returns the exact analytical gradients of the Low-Fidelity ODE proxy 
-        to guide the High-Fidelity MC optimizer.
-        """
-        if method != 'MC':
-            return '2-point' # Fallback to finite differences for analytical methods
-
-        def _surrogate_obj(p_tensor):
-            rhos = p_tensor[:self.n_exp]
-            nus = p_tensor[self.n_exp:]
-            
-            # Map the parameters exactly to the flattened grid without heavy interpolators
-            rho_mapped = rhos[self.t_indices]
-            nu_mapped = nus[self.t_indices]
-            
-            v_ode = self.rough_sabr_vol_ode_torch(
-                self.K_flat_t, self.T_flat_t, self.alpha_flat_t, 
-                rho_mapped, nu_mapped, H
-            )
-            return (v_ode - torch.tensor(self.market_vols, dtype=torch.float64)) * 10000.0
-
-        # Compute exact Jacobian over all parameters simultaneously
-        p_t = torch.tensor(p, dtype=torch.float64, requires_grad=True)
-        jac = torch.autograd.functional.jacobian(_surrogate_obj, p_t)
-        
-        return jac.detach().cpu().numpy()
-    
 
 class CorrelationCalibrator:
     def __init__(self, atm_vol_matrix, model):
-        """
-        Matrix AMMO Calibrator (Stage 2): Fits the N x N spatial correlation matrix
-        using a Low-Fidelity ODE Surrogate with exact PyTorch Autograd Jacobians.
-        """
         self.model = model
         self.device = model.device
         self.N = model.N
         self.grid_T = model.T.cpu().numpy()
         
-        # Flatten the ATM matrix
         expiries, tenors, vols = [], [], []
         for exp in atm_vol_matrix.index:
             for ten in atm_vol_matrix.columns:
@@ -551,19 +353,15 @@ class CorrelationCalibrator:
         self.tenors = np.array(tenors)
         self.market_vols = np.array(vols)
         
-        # Initialize Rapisarda angles matrix ((N+1) x (N+1))
-        # Row 0 = Z(t) volatility driver. Rows 1 to N = Forward Rates.
         self.omega = np.zeros((self.N + 1, self.N + 1))
         
-        # 1. Anchor the first column exactly to Stage 1 spot-volatility correlations
         rhos_np = np.clip(self.model.rhos.detach().cpu().numpy(), -0.9999, 0.9999)
         self.omega[1:, 0] = np.arccos(rhos_np)
         
-        # 2. Shift spatial constraints +1 column to the right
         if self.N > 1:
-            self.omega[2, 1] = 0.0 # cos(0) = 1.0 (Perfect spatial correlation for unidentifiable short end)
+            self.omega[2, 1] = 0.0 
         if self.N > 2:
-            self.omega[3:, 2] = np.pi / 2.0 # cos(pi/2) = 0.0 (Orthogonalize next unidentifiable factor)
+            self.omega[3:, 2] = np.pi / 2.0 
 
     def calibrate(self):
         import time
@@ -575,7 +373,6 @@ class CorrelationCalibrator:
         
         start_time = time.time()
         
-        # Loop through each row of the correlation matrix incrementally
         for i in range(2, self.N):
             row_start_time = time.time()
             target_maturity = self.grid_T[i+1] 
@@ -591,7 +388,7 @@ class CorrelationCalibrator:
                 print("Skipped (No co-terminal swaptions found)")
                 continue
 
-            idx = i + 1 # The corresponding row in the (N+1)x(N+1) matrix 
+            idx = i + 1 
             free_indices = [1] + list(range(3, idx))
             if not free_indices:
                 print("Skipped (No free correlation angles)")
@@ -606,30 +403,23 @@ class CorrelationCalibrator:
             best_mc_rmse = np.inf
             best_p = current_p.copy()
             
-            # --- AMMO OUTER LOOP (Recourse to High-Fidelity) ---
-            # 2 iterations are sufficient to perfectly lock the gap
             for ammo_iter in range(2):
                 
-                # 1. Update Matrix with current guess
                 self.omega[idx, free_indices] = current_p
                 omega_tensor = torch.tensor(self.omega, device=self.device, dtype=self.model.dtype)
                 Sigma_matrix = build_rapisarda_correlation_matrix(omega_tensor)
                 
-                # 2. Evaluate High-Fidelity (MC) and Low-Fidelity (ODE) EXACTLY ONCE
                 v_mc = mapped_smm_pricer(self.model, Sigma_matrix, exp_targets, ten_targets, strikes, dt=1.0/24.0, n_paths=4096)
                 v_ode = mapped_smm_ode(self.model, Sigma_matrix, exp_targets, ten_targets, strikes)
                 v_ode_np = v_ode.detach().cpu().numpy()
                 
-                # Check Absolute Convergence
                 mc_rmse = np.sqrt(np.mean(((v_mc - vol_targets)*10000.0)**2))
                 if mc_rmse < best_mc_rmse:
                     best_mc_rmse = mc_rmse
                     best_p = current_p.copy()
                     
-                # 3. Establish the Additive Defect Gap (Zero-Order Consistency)
                 delta_k = v_mc - v_ode_np
                 
-                # 4. Define the Ultra-Fast Surrogate Objective
                 def ammo_surrogate(p_inner):
                     self.omega[idx, free_indices] = p_inner
                     o_t = torch.tensor(self.omega, device=self.device, dtype=self.model.dtype)
@@ -637,24 +427,26 @@ class CorrelationCalibrator:
                     v_surr = mapped_smm_ode(self.model, S_mat, exp_targets, ten_targets, strikes)
                     return (v_surr.detach().cpu().numpy() + delta_k - vol_targets) * 10000.0
                     
-                # 5. Define the PyTorch Analytical Jacobian (First-Order Consistency)
                 def ammo_jacobian(p_inner):
                     def _diff_obj(p_tensor):
-                        # Safely reconstruct omega tensor for Autograd tracking
                         o_mod = torch.tensor(self.omega, device=self.device, dtype=self.model.dtype).clone()
-                        o_mod[idx, free_indices] = p_tensor  # Inject differentiable variables
+                        o_mod[idx, free_indices] = p_tensor  
                         
                         S_mat = build_rapisarda_correlation_matrix(o_mod)
                         v_surr = mapped_smm_ode(self.model, S_mat, exp_targets, ten_targets, strikes)
                         
-                        # Add constant defect gap and compare to target
                         return (v_surr + torch.tensor(delta_k, device=self.device) - torch.tensor(vol_targets, device=self.device)) * 10000.0
                         
                     p_t = torch.tensor(p_inner, device=self.device, dtype=self.model.dtype, requires_grad=True)
                     jac = torch.autograd.functional.jacobian(_diff_obj, p_t)
-                    return jac.detach().cpu().numpy()
+                    
+                    # CATCH NANS BEFORE THEY HIT SCIPY TO PREVENT CRASH
+                    jac_np = jac.detach().cpu().numpy()
+                    if not np.isfinite(jac_np).all():
+                        jac_np = np.nan_to_num(jac_np, nan=0.0, posinf=0.0, neginf=0.0)
+                        
+                    return jac_np
 
-                # 6. Inner Optimization (SciPy only interacts with the fast ODE Surrogate)
                 res = least_squares(
                     ammo_surrogate, current_p, bounds=bounds, 
                     jac=ammo_jacobian, method='trf', 
@@ -662,13 +454,11 @@ class CorrelationCalibrator:
                 )
                 current_p = res.x
                 
-            # Lock in the best verified angles
             self.omega[idx, free_indices] = best_p
             
             row_time = time.time() - row_start_time
             print(f"Done! RMSE: {best_mc_rmse:5.2f} bps | Time: {row_time:4.2f}s")
         
-        # Finalize the Sigma Matrix
         omega_tensor = torch.tensor(self.omega, device=self.device, dtype=self.model.dtype)
         Sigma_final = build_rapisarda_correlation_matrix(omega_tensor)
         

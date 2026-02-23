@@ -176,15 +176,13 @@ def mapped_smm_pricer(model, Sigma_matrix, expiries, tenors, strike_offsets, dt=
 def mapped_smm_ode(model, Sigma_matrix, expiries, tenors, strike_offsets):
     """
     Low-Fidelity Surrogate for Stage 2 (AMMO Framework).
-    Performs the exact Adachi (2025) SMM mapping, but prices the resulting 
-    parameters using the analytical Fukasawa-Gatheral ODE proxy.
-    Fully differentiable via PyTorch Autograd.
+    Uses the Effective Classical Normal SABR Mapping. 
+    Now strictly armored against PyTorch Autograd NaN/Inf gradient explosions.
     """
     device = model.device
     dtype = model.dtype
     n_options = len(expiries)
     
-    # 1. Base yield curve setup
     tau = model.tau
     F0 = model.F0
     P0 = torch.cumprod(torch.cat([torch.tensor([1.0], device=device, dtype=dtype), 1.0 / (1.0 + tau * F0)]), dim=0)
@@ -192,10 +190,7 @@ def mapped_smm_ode(model, Sigma_matrix, expiries, tenors, strike_offsets):
     eta_F0 = torch.pow(torch.abs(F0 + model.shift), model.beta_sabr)
     alpha_normal = model.alphas * eta_F0 
     
-    # Use lists to accumulate tensors. This preserves the Autograd computational graph!
-    alpha_smm_list = []
-    rho_smm_list = []
-    nu_smm_list = []
+    alpha_smm_list, rho_smm_list, nu_smm_list = [], [], []
     
     for i in range(n_options):
         T_exp = expiries[i]
@@ -207,7 +202,7 @@ def mapped_smm_ode(model, Sigma_matrix, expiries, tenors, strike_offsets):
         if end_idx <= start_idx:
             alpha_smm_list.append(torch.tensor(1e-5, device=device, dtype=dtype))
             rho_smm_list.append(torch.tensor(0.0, device=device, dtype=dtype))
-            nu_smm_list.append(torch.tensor(model.nus[0].item(), device=device, dtype=dtype))
+            nu_smm_list.append(torch.tensor(model.nus[start_idx].item(), device=device, dtype=dtype))
             continue
             
         P_I = P0[start_idx]
@@ -222,56 +217,53 @@ def mapped_smm_ode(model, Sigma_matrix, expiries, tenors, strike_offsets):
             Pi_j = (tau[j_global] * P0[j_global+1]) / (A0 * P0[j_global]) * (P_J + S0 * sum_P)
             pi_weights[j_local] = Pi_j * alpha_normal[j_global]
             
-        # Mapped Normal Variance
         Sigma_slice = Sigma_matrix[start_idx+1 : end_idx+1, start_idx+1 : end_idx+1]
         v_0 = torch.matmul(pi_weights.unsqueeze(0), torch.matmul(Sigma_slice, pi_weights.unsqueeze(1))).squeeze()
-        
         a_smm = torch.sqrt(torch.clamp(v_0, min=1e-14))
         alpha_smm_list.append(a_smm)
         
-        # Mapped Vol-of-Vol Correlation
         rho_slice = Sigma_matrix[start_idx+1 : end_idx+1, 0]
         rho_mapped = torch.sum(rho_slice * pi_weights) / a_smm
         rho_smm_list.append(torch.clamp(rho_mapped, -0.999, 0.999))
 
-        # Mapped Volatility-of-Volatility
         nu_mapped = torch.sum(model.nus[start_idx:end_idx] * pi_weights) / (torch.sum(pi_weights) + 1e-12)
         nu_smm_list.append(nu_mapped)
               
-    # Convert accumulated lists back to stacked tensors for vectorized math
     alpha_smm = torch.stack(alpha_smm_list)
     rho_smm = torch.stack(rho_smm_list)
     nu_smm = torch.stack(nu_smm_list)
     
-    # 2. Evaluate Pure PyTorch ODE (Fukasawa-Gatheral Expansion)
     k_t = torch.tensor(strike_offsets, device=device, dtype=dtype)
     T_t = torch.tensor(expiries, device=device, dtype=dtype)
-    nu = nu_smm
     H = model.H
     
-    y = (nu * (T_t**(H - 0.5)) * k_t) / alpha_smm
+    # 1. EXACT NORMALIZATION
+    c_H = 1.0 / (torch.sqrt(2.0 * H) * torch.exp(torch.lgamma(H + 0.5)))
+    nu_eff = nu_smm * c_H
     
-    def G_half(z, r):
-        inner = torch.sqrt(1.0 + r * z + z**2 / 4.0) - r - z / 2.0
-        return 4.0 * (torch.log(inner / (1.0 - r)))**2
-        
-    def G_zero(z, r):
-        term1 = torch.log(1.0 + 2.0 * r * z + z**2)
-        denom = torch.sqrt(1.0 - r**2)
-        term2 = (2.0 * r / denom) * (torch.atan(r / denom) - torch.atan((z + r) / denom))
-        return term1 + term2
-
-    safe_y = torch.where(torch.abs(y) < 1e-12, torch.tensor(1e-12, dtype=dtype, device=device), y)
-    z0 = safe_y / (2.0 * H + 1.0)
-    z_half = 2.0 * safe_y / (2.0 * H + 1.0)
+    # 2. ROUGH TO CLASSICAL MAPPING 
+    A = (rho_smm * nu_eff) / (H + 0.5) * (T_t**(H - 0.5))
+    B = (2.0 - 3.0 * rho_smm**2) * (nu_eff**2) * (T_t**(2.0*H - 1.0))
     
-    w0 = 3.0 * (1.0 - 2.0 * H) / (2.0 * H + 3.0)
-    w_half = 2.0 * H / (2.0 * H + 3.0)
+    nu_cl = torch.sqrt(torch.clamp((B + 3.0 * A**2) / 2.0, min=1e-12))
+    rho_cl = torch.clamp(A / nu_cl, min=-0.9999, max=0.9999)
     
-    G_A = ((2.0 * H + 1.0)**2) * (w0 * G_zero(z0, rho_smm) + w_half * G_half(z_half, rho_smm))
-    G_A_safe = torch.clamp(G_A, min=1e-14)
+    # 3. GLOBALLY STABLE HAGAN NORMAL BACKBONE (Autograd Safe)
+    z_cl = (nu_cl / alpha_smm) * k_t
     
-    ratio = torch.where(torch.abs(y) < 1e-12, torch.tensor(1.0, dtype=dtype, device=device), torch.abs(safe_y) / torch.sqrt(G_A_safe))
+    # Clamp square root to prevent infinite gradients
+    sq_arg = torch.clamp(1.0 - 2.0 * rho_cl * z_cl + z_cl**2, min=1e-10)
+    inner = torch.sqrt(sq_arg) + z_cl - rho_cl
     
-    # Return Implied Volatility (in absolute terms)
-    return alpha_smm * ratio
+    # Clamp log argument to prevent -Inf / NaN gradients
+    log_arg = torch.clamp(inner / (1.0 - rho_cl), min=1e-10)
+    x_z = torch.log(log_arg)
+    
+    # Safe mask to avoid 0/0 division during backward pass
+    safe_x_z = torch.where(torch.abs(x_z) < 1e-8, torch.tensor(1e-8, dtype=dtype, device=device), x_z)
+    ratio = torch.where(torch.abs(z_cl) < 1e-8, torch.tensor(1.0, dtype=dtype, device=device), z_cl / safe_x_z)
+    
+    # 4. EXACT NORMAL TIME-DRIFT
+    drift = (2.0 - 3.0 * rho_smm**2) / 24.0 * (nu_eff**2) * (T_t**(2.0*H))
+    
+    return alpha_smm * ratio * (1.0 + drift)

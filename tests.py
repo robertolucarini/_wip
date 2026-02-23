@@ -553,11 +553,61 @@ def run_correlation_consistency_test():
     print("=" * 65)
 
 
+def run_nu_term_structure_sensitivity_test():
+    print("\n" + "="*65)
+    print(f"{'TEST 8: NU TERM-STRUCTURE SENSITIVITY TEST':^65}")
+    print("="*65)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    ois_func = load_discount_curve("data/estr_disc.csv")
+    grid_T, F0_rates = bootstrap_forward_rates(ois_func, max_maturity=30.0)
+
+    alpha_f = lambda T: np.full_like(T, 0.0150)
+    rho_f = lambda T: np.full_like(T, -0.40)
+    nu_flat = lambda T: np.full_like(T, 0.50)
+    nu_slope = lambda T: 0.35 + 0.35 * (np.array(T) / 30.0)
+    H = 0.15
+
+    model_flat = TorchRoughSABR_FMM(
+        grid_T, F0_rates, alpha_f, rho_f, nu_flat, H,
+        beta_sabr=0.5, shift=0.03, correlation_mode='pca', n_factors=3, device=device
+    )
+    model_slope = TorchRoughSABR_FMM(
+        grid_T, F0_rates, alpha_f, rho_f, nu_slope, H,
+        beta_sabr=0.5, shift=0.03, correlation_mode='pca', n_factors=3, device=device
+    )
+
+    n_paths = 4096
+    time_grid = torch.linspace(0.0, 2.0, 2 * 24 + 1, device=device, dtype=torch.float64)
+    target_idx = torch.argmin(torch.abs(torch.tensor(grid_T, device=device, dtype=model_flat.dtype) - 10.0)).item()
+
+    with torch.no_grad():
+        F_flat = model_flat.simulate_forward_curve(n_paths, time_grid, seed=91, freeze_drift=True)
+        F_slope = model_slope.simulate_forward_curve(n_paths, time_grid, seed=91, freeze_drift=True)
+
+    mean_flat = torch.mean(F_flat[:, -1, target_idx]).item()
+    mean_slope = torch.mean(F_slope[:, -1, target_idx]).item()
+    diff_bps = abs(mean_flat - mean_slope) * 10000.0
+
+    print(f"{'Mean F(T) with flat nu':<40} | {mean_flat*10000:.4f} bps")
+    print(f"{'Mean F(T) with sloped nu':<40} | {mean_slope*10000:.4f} bps")
+    print(f"{'Absolute difference':<40} | {diff_bps:.4f} bps")
+
+    if diff_bps > 0.01:
+        print("Status: PASS (Simulation is sensitive to nu term-structure changes)")
+    else:
+        print("Status: WARNING (Very low sensitivity to nu term-structure changes)")
+    print("=" * 65)
+
+
+
 if __name__ == '__main__':
-    run_martingale_test()
     run_aad_vs_fd_test()
+    run_martingale_test()
     run_extreme_regime_test()
     run_put_call_parity_test()
-    # run_reproducibility_test()
-    # run_time_step_stability_test()
-    # run_correlation_consistency_test()
+    run_reproducibility_test()
+    run_time_step_stability_test()
+    run_correlation_consistency_test()
+    run_nu_term_structure_sensitivity_test()

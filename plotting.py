@@ -115,6 +115,10 @@ def make_market_vs_model_surface_plot(
     
     residuals_bps = model_vols_bps - market_vols_bps
 
+    residual_rmse_bps = float(np.sqrt(np.nanmean(residuals_bps**2)))
+    atm_idx = int(np.argmin(np.abs(calibrator.strike_offsets)))
+    atm_rmse_bps = float(np.sqrt(np.nanmean(residuals_bps[:, atm_idx]**2)))
+
     strikes_bps = calibrator.strike_offsets * 10000.0
     expiries = calibrator.expiries
     extent = [strikes_bps[0], strikes_bps[-1], expiries[-1], expiries[0]]
@@ -138,13 +142,13 @@ def make_market_vs_model_surface_plot(
 
     rlim = max(abs(np.nanmin(residuals_bps)), abs(np.nanmax(residuals_bps)))
     im2 = axes[2].imshow(residuals_bps, aspect='auto', cmap='RdBu_r', extent=extent, vmin=-rlim, vmax=rlim)
-    axes[2].set_title(f"Residuals (Model - Market), RMSE={calib['rmse_bps']:.2f} bps")
+    axes[2].set_title(f"Residuals (Model - Market), Full RMSE={residual_rmse_bps:.2f} bps")
     axes[2].set_xlabel('Strike Offset (bps)')
     axes[2].set_ylabel('Expiry (Years)')
     fig.colorbar(im2, ax=axes[2], label='Residual (bps)')
 
     fig.suptitle(
-        f"Market vs Model Vol Surface | Underlying={tenor:.1f}Y | Calib={calibration_method.upper()} | {stage_label} | H={calib['H']:.3f}",
+            f"Market vs Model Vol Surface | Underlying={tenor:.1f}Y | Calib={calibration_method.upper()} | {stage_label} | H={calib['H']:.3f} | ATM RMSE={atm_rmse_bps:.2f} bps",
         fontsize=12,
     )
     
@@ -214,7 +218,7 @@ def make_optimal_parameter_term_structure_plot(
     axes[1].set_ylabel('rho(T)')
     axes[1].grid(alpha=0.3)
 
-    axes[2].plot(T, nu_stage1, marker='o', color='tab:green')
+    axes[2].plot(T, nu_stage1, marker='o', color='tab:green', label='Stage-1 nu(T) input')
     axes[2].set_xlabel('Expiry (Years)')
     axes[2].set_ylabel('nu(T)')
     axes[2].grid(alpha=0.3)
