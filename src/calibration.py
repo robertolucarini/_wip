@@ -9,6 +9,7 @@ from src.utils import build_rapisarda_correlation_matrix
 from src.pricers import mapped_smm_pricer
 import time
 import pandas as pd
+from src.utils import build_rapisarda_correlation_matrix, log_progress
 
 
 def mc_rough_bergomi_pricer(K_flat, T_flat, alpha_flat, rho_flat, nu_in, H, n_paths=(32768/2), dt=1.0/50.0, kappa_hybrid=1, device='cpu'):
@@ -174,15 +175,16 @@ class RoughSABRCalibrator:
 
     def calibrate(self, method='PURE_MC', H_grid=np.array([0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50])):
         import time
+        
         print("\n" + "="*60)
-        print(f"{f'ROUGH SABR 1D CALIBRATION (GLOBAL NU | {method.upper()})':^60}")
+        print(f"{f'ROUGH SABR 1D CALIBRATION | MODE: {method.upper()}':^60}")
         print("="*60)
         
         best_rmse = np.inf
         best_H = None
         best_alphas = None
         best_rhos = None
-        best_nu = None  # Global Nu
+        best_nu = None
         
         atm_idx = np.argmin(np.abs(self.strike_offsets))
         base_market_alphas = self.vol_matrix.iloc[:, atm_idx].values.copy()
@@ -191,13 +193,15 @@ class RoughSABRCalibrator:
         
         for i, H in enumerate(H_grid):
             step_start_time = time.time()
-            print(f"Grid {i+1:2d}/{len(H_grid)} | Testing Hurst (H) = {H:.3f} | ", end="", flush=True)
+            log_progress("Stage 1", f"Grid {i+1:2d}/{len(H_grid)} | Testing Hurst (H) = {H:.3f}", level=0)
             
-            # --- STEP 1: PRE-OPTIMIZATION (SEEDED GLOBAL NU) ---
-            
-            # 1a. The "Dirty" Local Fit to find the neighborhood
+            # ==========================================================
+            # 1. THE "DIRTY" LOCAL SEEDING FIT
+            # ==========================================================
+            log_progress("Pre-Opt", "Running independent slice fits for smart seeding...", level=1)
             local_nus = np.zeros(self.n_exp)
             local_rhos = np.zeros(self.n_exp)
+            
             for j, exp_t in enumerate(self.expiries):
                 mask = np.abs(self.T_flat - exp_t) < 1e-6
                 k_targets = self.K_flat[mask]
@@ -213,134 +217,92 @@ class RoughSABRCalibrator:
                 res_local = least_squares(slice_obj, [-0.1, 0.4], bounds=([-0.999, 0.001], [0.999, 10.0]), method='trf')
                 local_rhos[j] = res_local.x[0]
                 local_nus[j] = res_local.x[1]
-
-            # 1b. The Strict Global Fit using the smart seed
-            smart_nu_guess = np.clip(np.mean(local_nus), 0.05, 5.0)
-            guess = np.concatenate(([smart_nu_guess], local_rhos))
             
+            smart_nu_guess = np.clip(np.mean(local_nus), 0.05, 5.0)
+            log_progress("Pre-Opt", f"Smart Global Nu Seed calculated: {smart_nu_guess:.4f}", level=1)
+            
+            guess_global = np.concatenate(([smart_nu_guess], local_rhos))
             lower_bounds = np.concatenate(([0.001], np.full(self.n_exp, -0.999)))
             upper_bounds = np.concatenate(([10.0], np.full(self.n_exp, 0.999)))
-            
-            def global_obj(p):
-                nu = p[0]
-                rhos = p[1:]
-                
-                r_ts = PchipInterpolator(self.expiries, rhos, extrapolate=True)
-                r_flat = r_ts(self.T_flat)
-                
-                alphas = self.exact_atm_alpha(self.expiries, base_market_alphas, rhos, nu, H)
-                a_ts = PchipInterpolator(self.expiries, alphas, extrapolate=True)
-                a_flat = a_ts(self.T_flat)
-                
-                v_surr = self.rough_sabr_vol_ode(self.K_flat, self.T_flat, a_flat, r_flat, nu, H)
-                return (v_surr - self.market_vols) * 10000.0
-                
-            res = least_squares(global_obj, guess, bounds=(lower_bounds, upper_bounds), method='trf')
-            
-            current_nu = res.x[0]
-            current_rhos = res.x[1:]
-            current_alphas = self.exact_atm_alpha(self.expiries, base_market_alphas, current_rhos, current_nu, H)
 
-
-            # --- STEP 2: AMMO LOOP (GLOBAL NU) ---
+            # ==========================================================
+            # 2a. THE "AMMO ODE" METHOD (Fast but mathematically flawed for Stage 1)
+            # ==========================================================
             if method == 'AMMO_ODE':
-                best_mc_rmse = np.inf
-                best_iter_alphas = current_alphas.copy()
-                best_iter_rhos = current_rhos.copy()
-                best_iter_nu = current_nu
+                log_progress("AMMO-Opt", "Running fast ODE surrogate optimization...", level=1)
+                def global_obj(p):
+                    nu = p[0]
+                    rhos = p[1:]
+                    r_ts = PchipInterpolator(self.expiries, rhos, extrapolate=True)
+                    r_flat = r_ts(self.T_flat)
+                    
+                    alphas = self.exact_atm_alpha(self.expiries, base_market_alphas, rhos, nu, H)
+                    a_ts = PchipInterpolator(self.expiries, alphas, extrapolate=True)
+                    a_flat = a_ts(self.T_flat)
+                    
+                    v_surr = self.rough_sabr_vol_ode(self.K_flat, self.T_flat, a_flat, r_flat, nu, H)
+                    return (v_surr - self.market_vols) * 10000.0
+                    
+                res = least_squares(global_obj, guess_global, bounds=(lower_bounds, upper_bounds), method='trf')
+                current_nu = res.x[0]
+                current_rhos = res.x[1:]
+                current_alphas = self.exact_atm_alpha(self.expiries, base_market_alphas, current_rhos, current_nu, H)
                 
-                for ammo_iter in range(3):
-                    a_ts = PchipInterpolator(self.expiries, current_alphas, extrapolate=True)
-                    r_ts = PchipInterpolator(self.expiries, current_rhos, extrapolate=True)
-                    
-                    v_mc = self.rough_sabr_vol_mc(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), current_nu, H)
-                    v_ode = self.rough_sabr_vol_ode(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), current_nu, H)
-                    
-                    mc_rmse = np.sqrt(np.mean(((v_mc - self.market_vols)*10000.0)**2))
-                    if mc_rmse < best_mc_rmse:
-                        best_mc_rmse = mc_rmse
-                        best_iter_alphas = current_alphas.copy()
-                        best_iter_rhos = current_rhos.copy()
-                        best_iter_nu = current_nu
-                        
-                    delta_k_full = v_mc - v_ode
-                    
-                    # Compute ATM target adjustments
-                    target_atms = np.zeros(self.n_exp)
-                    for j, exp_t in enumerate(self.expiries):
-                        mask = np.abs(self.T_flat - exp_t) < 1e-6
-                        k_targets = self.K_flat[mask]
-                        dk_targets = delta_k_full[mask]
-                        atm_mask = (np.abs(k_targets) < 1e-6)
-                        dk_atm = dk_targets[atm_mask][0] if np.any(atm_mask) else 0.0
-                        target_atms[j] = base_market_alphas[j] - dk_atm
+                a_ts = PchipInterpolator(self.expiries, current_alphas, extrapolate=True)
+                r_ts = PchipInterpolator(self.expiries, current_rhos, extrapolate=True)
+                v_final = self.rough_sabr_vol_ode(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), current_nu, H)
+                rmse = np.sqrt(np.mean(((v_final - self.market_vols)*10000.0)**2))
 
-                    # Optimize AMMO Surrogate globally
-                    def ammo_global(p):
-                        nu = p[0]
-                        rhos = p[1:]
-                        r_ts = PchipInterpolator(self.expiries, rhos, extrapolate=True)
-                        r_flat = r_ts(self.T_flat)
-                        
-                        alphas = self.exact_atm_alpha(self.expiries, target_atms, rhos, nu, H)
-                        a_ts = PchipInterpolator(self.expiries, alphas, extrapolate=True)
-                        a_flat = a_ts(self.T_flat)
-                        
-                        v_surr = self.rough_sabr_vol_ode(self.K_flat, self.T_flat, a_flat, r_flat, nu, H)
-                        return (v_surr + delta_k_full - self.market_vols) * 10000.0
-                        
-                    guess_ammo = np.concatenate(([current_nu], current_rhos))
-                    res_ammo = least_squares(ammo_global, guess_ammo, bounds=(lower_bounds, upper_bounds), method='trf')
-                    
-                    current_nu = res_ammo.x[0]
-                    current_rhos = res_ammo.x[1:]
-                    current_alphas = self.exact_atm_alpha(self.expiries, target_atms, current_rhos, current_nu, H)
-                        
-                rmse = best_mc_rmse
-                current_alphas = best_iter_alphas
-                current_rhos = best_iter_rhos
-                current_nu = best_iter_nu
-
-            # --- STEP 2: PURE MC POLISH (NO ODE SURROGATE) ---
-            elif method == 'PURE_MC':
-                print(f"   -> Switching to Pure MC Optimization (Fixed Seed)...")
+            # ==========================================================
+            # 2b. THE "PURE MC" METHOD (Slow but structurally correct)
+            # ==========================================================
+            elif method in ['PURE_MC', 'MC']:
+                log_progress("MC-Opt", "Starting Pure Monte Carlo Global Optimization (This will take time)...", level=1)
                 
-                # We use the ODE-calibrated parameters as our starting point to save time
-                guess_mc = np.concatenate(([current_nu], current_rhos))
+                # Counter trick to prevent logging every single Jacobian bump
+                eval_counter = [0]
                 
                 def mc_global_obj(p):
+                    eval_counter[0] += 1
+                    # Log every 20 evaluations so you know it hasn't crashed
+                    if eval_counter[0] % 20 == 0:
+                        log_progress("MC-Opt", f"Evaluations: {eval_counter[0]:>3} | Current Nu: {p[0]:.4f} | Mean Rho: {np.mean(p[1:]):.4f}", level=2)
+                        
                     nu = p[0]
                     rhos = p[1:]
                     
                     r_ts = PchipInterpolator(self.expiries, rhos, extrapolate=True)
                     r_flat = r_ts(self.T_flat)
                     
-                    # Compute ATM alphas
                     alphas = self.exact_atm_alpha(self.expiries, base_market_alphas, rhos, nu, H)
                     a_ts = PchipInterpolator(self.expiries, alphas, extrapolate=True)
                     a_flat = a_ts(self.T_flat)
                     
-                    # EVALUATE TRUE MC (Ignoring the flawed ODE entirely)
                     v_mc = self.rough_sabr_vol_mc(self.K_flat, self.T_flat, a_flat, r_flat, nu, H)
                     return (v_mc - self.market_vols) * 10000.0
                 
-                # We use diff_step=1e-3 to widen the finite-difference delta, 
-                # cutting through the MC Sobol noise to get a clean gradient.
-                res_mc = least_squares(mc_global_obj, guess_mc, bounds=(lower_bounds, upper_bounds), 
-                                       method='trf', diff_step=1e-3, ftol=1e-4, xtol=1e-4)
+                log_progress("MC-Opt", "Handing over to scipy.least_squares (verbose=2 for iteration logs)...", level=1)
+                
+                # verbose=2 tells scipy to print a table row for every successful gradient step
+                res_mc = least_squares(mc_global_obj, guess_global, bounds=(lower_bounds, upper_bounds), 
+                                       method='trf', diff_step=1e-3, ftol=1e-4, xtol=1e-4, verbose=2)
+                
+                log_progress("MC-Opt", f"Optimization converged after {res_mc.nfev} MC evaluations.", level=1)
                 
                 current_nu = res_mc.x[0]
                 current_rhos = res_mc.x[1:]
                 current_alphas = self.exact_atm_alpha(self.expiries, base_market_alphas, current_rhos, current_nu, H)
                 
-                # Final evaluation for RMSE
                 a_ts = PchipInterpolator(self.expiries, current_alphas, extrapolate=True)
                 r_ts = PchipInterpolator(self.expiries, current_rhos, extrapolate=True)
                 v_final = self.rough_sabr_vol_mc(self.K_flat, self.T_flat, a_ts(self.T_flat), r_ts(self.T_flat), current_nu, H)
                 rmse = np.sqrt(np.mean(((v_final - self.market_vols)*10000.0)**2))
 
+            # ==========================================================
+            # 3. END OF LOOP RECORDING
+            # ==========================================================
             step_time = time.time() - step_start_time
-            print(f"Done! RMSE: {rmse:6.2f} bps | Time: {step_time:5.2f}s")
+            log_progress("Stage 1", f"Done! RMSE: {rmse:6.2f} bps | Nu: {current_nu:.4f} | Time: {step_time:5.2f}s\n", level=0)
             
             if rmse < best_rmse:
                 best_rmse = rmse
@@ -357,7 +319,6 @@ class RoughSABRCalibrator:
         print(f"1D Calibration Total Time: {total_time:.2f}s")
         print("="*60)
         
-        # We return a constant lambda function for nu so it plugs directly into main.py without breaking your Torch model setup
         nu_func = lambda t: np.full_like(t, best_nu, dtype=float) if isinstance(t, np.ndarray) else float(best_nu)
         
         return {
@@ -367,7 +328,7 @@ class RoughSABRCalibrator:
             'rho_func': PchipInterpolator(self.expiries, best_rhos, extrapolate=True),
             'nu_func': nu_func
         }
-            
+           
 
     def rough_sabr_vol_mc(self, k, T, alpha, rho, nu, H):
         device = 'cpu'
