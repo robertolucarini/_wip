@@ -264,9 +264,9 @@ class RoughSABRCalibrator:
                 
                 def mc_global_obj(p):
                     eval_counter[0] += 1
-                    # Log every 20 evaluations so you know it hasn't crashed
-                    if eval_counter[0] % 20 == 0:
-                        log_progress("MC-Opt", f"Evaluations: {eval_counter[0]:>3} | Current Nu: {p[0]:.4f} | Mean Rho: {np.mean(p[1:]):.4f}", level=2)
+                    
+                    # Log EVERY evaluation and force Python to flush it to the screen instantly
+                    print(f"   [MC-Opt] Eval: {eval_counter[0]:>3} | Current Nu: {p[0]:.4f} | Mean Rho: {np.mean(p[1:]):.4f}", flush=True)
                         
                     nu = p[0]
                     rhos = p[1:]
@@ -280,6 +280,7 @@ class RoughSABRCalibrator:
                     
                     v_mc = self.rough_sabr_vol_mc(self.K_flat, self.T_flat, a_flat, r_flat, nu, H)
                     return (v_mc - self.market_vols) * 10000.0
+                
                 
                 log_progress("MC-Opt", "Handing over to scipy.least_squares (verbose=2 for iteration logs)...", level=1)
                 
