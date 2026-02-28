@@ -22,7 +22,7 @@ from config import BETA_SABR, SHIFT_SABR
 # Calibration Stage 1
 # ========================================================================
 # 1. RESULTS
-def generate_stage1_results(methods=['polynomial', 'AMMO_ODE', 'PURE_MC']):
+def generate_stage1_results(methods=['AMMO_ODE', 'PURE_MC']):
     """
     Runs Stage 1 calibration across multiple methods and stores the resulting 
     parameters and estimated volatility surfaces for later analysis.
@@ -147,122 +147,105 @@ def print_full_latex_longtable(csv_path="results/stage1_parameters.csv"):
     if not os.path.exists(csv_path):
         print(f"Error: {csv_path} not found.")
         return
-        
+
     df = pd.read_csv(csv_path)
-    
-    # THE FIX: Round the floats to eliminate precision mismatch!
     df['H'] = df['H'].round(3)
     df['Expiry'] = df['Expiry'].round(3)
-    
-    # Get all unique H and expiries, sorted
+
     all_Hs = sorted(df['H'].unique())
     all_expiries = sorted(df['Expiry'].unique())
-    
+
+    def extract_row(subset_h, exp, method):
+        row = subset_h[(subset_h['Expiry'] == exp) & (subset_h['Method'] == method)]
+        if row.empty:
+            return '-', '-', np.inf, '-'
+        alpha = f"{row['Alpha'].values[0] * 10000.0:.1f}"
+        rho = f"{row['Rho'].values[0]:.3f}"
+        rmse_val = row['RMSE_bps'].values[0]
+        rmse = f"{rmse_val:.2f}"
+        return alpha, rho, rmse_val, rmse
+
+    def build_panel_cells(subset_h, exp):
+        mc_alpha, mc_rho, mc_rmse_val, mc_rmse = extract_row(subset_h, exp, 'PURE_MC')
+        ode_alpha, ode_rho, ode_rmse_val, ode_rmse = extract_row(subset_h, exp, 'AMMO_ODE')
+
+        if np.isfinite(mc_rmse_val) and np.isfinite(ode_rmse_val):
+            if mc_rmse_val < ode_rmse_val:
+                mc_rmse = f"\\textbf{{{mc_rmse}}}"
+            elif ode_rmse_val < mc_rmse_val:
+                ode_rmse = f"\\textbf{{{ode_rmse}}}"
+
+        return [mc_alpha, ode_alpha, mc_rho, ode_rho, mc_rmse, ode_rmse]
+
+    br = r"\\"
+    n_h = len(all_Hs)
+    col_spec = 'c|' + '|'.join(['cccccc'] * n_h)
+
     latex = []
-    
-    # We use longtable so it breaks beautifully across pages in the PDF
+    latex.append(r"\begin{landscape}")
     latex.append(r"\begin{center}")
-    latex.append(r"\small")
-    latex.append(r"\begin{longtable}{c c c c c c c}")
-    latex.append(r"    \caption{Comparison of calibrated marginal parameters (Stage 1). PURE\_MC successfully untraps the volatility-of-volatility parameter ($\nu$) from the asymptotic ODE breakdown, resulting in significantly lower RMSE.} \label{tab:stage1_full_comparison} \\")
-    latex.append(r"    \toprule")
-    latex.append(r"    & \multicolumn{2}{c}{\textbf{$\alpha$ (bps)}} & \multicolumn{2}{c}{\textbf{$\rho$}} & \multicolumn{2}{c}{\textbf{RMSE (bps)}} \\")
-    latex.append(r"    \cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7}")
-    latex.append(r"    \textbf{Expiry} & \textbf{MC} & \textbf{ODE} & \textbf{MC} & \textbf{ODE} & \textbf{MC} & \textbf{ODE} \\")
-    latex.append(r"    \midrule")
-    latex.append(r"    \endfirsthead")
-    latex.append(r"")
-    latex.append(r"    % Header for subsequent pages")
-    latex.append(r"    \multicolumn{7}{c}%")
-    latex.append(r"    {{\bfseries \tablename\ \thetable{} -- continued from previous page}} \\")
-    latex.append(r"    \toprule")
-    latex.append(r"    & \multicolumn{2}{c}{\textbf{$\alpha$ (bps)}} & \multicolumn{2}{c}{\textbf{$\rho$}} & \multicolumn{2}{c}{\textbf{RMSE (bps)}} \\")
-    latex.append(r"    \cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7}")
-    latex.append(r"    \textbf{Expiry} & \textbf{MC} & \textbf{ODE} & \textbf{MC} & \textbf{ODE} & \textbf{MC} & \textbf{ODE} \\")
-    latex.append(r"    \midrule")
-    latex.append(r"    \endhead")
-    latex.append(r"")
-    latex.append(r"    \midrule")
-    latex.append(r"    \multicolumn{7}{r}{{Continued on next page}} \\")
-    latex.append(r"    \endfoot")
-    latex.append(r"")
-    latex.append(r"    \bottomrule")
-    latex.append(r"    \endlastfoot")
-    latex.append(r"")
-    
+    latex.append(r"\scriptsize")
+    latex.append(r"\setlength{\tabcolsep}{3pt}")
+    latex.append(r"\begin{longtable}{" + col_spec + "}")
+    latex.append(r"\caption{Stage 1 calibrated parameters (MC vs ODE) shown horizontally for all H values. The table is in landscape mode so the PDF page should be rotated for reading.}" + br)
+    latex.append(r"\toprule")
+
+    # Header row 1: H panels
+    h_header = [r"\textbf{Expiry}"]
     for h in all_Hs:
-        # Now we can safely use direct equality
         subset_h = df[df['H'] == h]
-        if subset_h.empty:
-            continue
-            
-        # Extract global Nu for the subheader
-        mc_nu_row = subset_h[subset_h['Method'] == 'PURE_MC']
-        ode_nu_row = subset_h[subset_h['Method'] == 'AMMO_ODE']
-        
-        mc_nu = mc_nu_row['Nu'].iloc[0] if not mc_nu_row.empty else np.nan
-        ode_nu = ode_nu_row['Nu'].iloc[0] if not ode_nu_row.empty else np.nan
-        
-        mc_nu_str = f"{mc_nu:.4f}" if not np.isnan(mc_nu) else "N/A"
-        ode_nu_str = f"{ode_nu:.4f}" if not np.isnan(ode_nu) else "N/A"
-        
-        # Add the H subheader with the global Nu values
-        latex.append(f"    \\multicolumn{{7}}{{l}}{{\\textbf{{$H = {h:.2f}$}} \\quad (Global $\\nu$: MC = {mc_nu_str}, ODE = {ode_nu_str})}} \\\\")
-        latex.append(r"    \midrule")
-        
-        first = True
-        for exp in all_expiries:
-            subset_exp = subset_h[subset_h['Expiry'] == exp]
-            if subset_exp.empty:
-                continue
-                
-            mc_row = subset_exp[subset_exp['Method'] == 'PURE_MC']
-            ode_row = subset_exp[subset_exp['Method'] == 'AMMO_ODE']
-            
-            # --- Format MC Values ---
-            if not mc_row.empty:
-                mc_alpha = f"{mc_row['Alpha'].values[0] * 10000.0:.1f}"
-                mc_rho = f"{mc_row['Rho'].values[0]:.3f}"
-                mc_rmse_val = mc_row['RMSE_bps'].values[0]
-                mc_rmse = f"{mc_rmse_val:.2f}"
-            else:
-                mc_alpha, mc_rho, mc_rmse_val, mc_rmse = "-", "-", np.inf, "-"
-                
-            # --- Format ODE Values ---
-            if not ode_row.empty:
-                ode_alpha = f"{ode_row['Alpha'].values[0] * 10000.0:.1f}"
-                ode_rho = f"{ode_row['Rho'].values[0]:.3f}"
-                ode_rmse_val = ode_row['RMSE_bps'].values[0]
-                ode_rmse = f"{ode_rmse_val:.2f}"
-            else:
-                ode_alpha, ode_rho, ode_rmse_val, ode_rmse = "-", "-", np.inf, "-"
-                
-            # --- Bold the winning RMSE ---
-            if not mc_row.empty and not ode_row.empty:
-                if mc_rmse_val < ode_rmse_val:
-                    mc_rmse = f"\\textbf{{{mc_rmse}}}"
-                elif ode_rmse_val < mc_rmse_val:
-                    ode_rmse = f"\\textbf{{{ode_rmse}}}"
-            
-            exp_str = f"{exp:.1f}Y"
-            
-            # Print RMSE only on the first row of the block to keep the table clean
-            if first:
-                latex.append(f"    {exp_str} & {mc_alpha} & {ode_alpha} & {mc_rho} & {ode_rho} & {mc_rmse} & {ode_rmse} \\\\")
-                first = False
-            else:
-                latex.append(f"    {exp_str} & {mc_alpha} & {ode_alpha} & {mc_rho} & {ode_rho} & & \\\\")
-                
-        latex.append(r"    \midrule")
-        
-    # Remove the last midrule to make it look clean against the bottomrule
-    if latex[-1].strip() == r"\midrule":
-        latex.pop()
-        
+        mc_nu = subset_h[subset_h['Method'] == 'PURE_MC']['Nu']
+        ode_nu = subset_h[subset_h['Method'] == 'AMMO_ODE']['Nu']
+        if (not mc_nu.empty) and (not ode_nu.empty):
+            nu_txt = f"MC \\nu={mc_nu.iloc[0]:.4f}, ODE \\nu={ode_nu.iloc[0]:.4f}"
+        else:
+            nu_txt = "N/A"
+        h_header.append(rf"\multicolumn{{6}}{{c|}}{{\textbf{{$H={h:.2f}$}} ({nu_txt})}}")
+    latex.append(' & '.join(h_header) + ' ' + br)
+
+    # Header row 2: Alpha/Rho/RMSE per panel
+    metric_header = ['']
+    for _ in all_Hs:
+        metric_header.extend([
+            r"\multicolumn{2}{c}{\textbf{Alpha (bps)}}",
+            r"\multicolumn{2}{c}{\textbf{Rho}}",
+            r"\multicolumn{2}{c|}{\textbf{RMSE (bps)}}"
+        ])
+    latex.append(' & '.join(metric_header) + ' ' + br)
+
+    # Header row 3: MC/ODE labels
+    method_header = [''] + ['MC', 'ODE', 'MC', 'ODE', 'MC', 'ODE'] * n_h
+    latex.append(' & '.join(method_header) + ' ' + br)
+    latex.append(r"\midrule")
+    latex.append(r"\endfirsthead")
+
+    # Continuation header
+    latex.append(r"\toprule")
+    latex.append(' & '.join(h_header) + ' ' + br)
+    latex.append(' & '.join(metric_header) + ' ' + br)
+    latex.append(' & '.join(method_header) + ' ' + br)
+    latex.append(r"\midrule")
+    latex.append(r"\endhead")
+    latex.append(r"\midrule")
+    latex.append(rf"\multicolumn{{{1 + 6*n_h}}}{{r}}{{Continued on next page}} {br}")
+    latex.append(r"\endfoot")
+    latex.append(r"\bottomrule")
+    latex.append(r"\endlastfoot")
+
+    # Body rows: one row per expiry, all H panels side-by-side
+    for exp in all_expiries:
+        row = [f"{exp:.1f}Y"]
+        for h in all_Hs:
+            subset_h = df[df['H'] == h]
+            row.extend(build_panel_cells(subset_h, exp))
+        latex.append(' & '.join(row) + ' ' + br)
+
     latex.append(r"\end{longtable}")
     latex.append(r"\end{center}")
-    
-    print("\n".join(latex))
+    latex.append(r"\end{landscape}")
+
+    print('\n'.join(latex))
+
 
 
 # 3. PARAMETERS CHARTS
@@ -329,42 +312,98 @@ def plot_parameter_grid(csv_path="results/stage1_parameters.csv", save_path="res
     print(f"Saved high-resolution grid to {save_path}")
 
 
-# 4. VOL SURFACE CHARTS
-def plot_true_3d_surfaces(method='PURE_MC', results_dir='results'):
-    # 1. Define file paths
+def plot_true_3d_surfaces(method='AMMO_ODE', results_dir='results', h_target=None, param_csv=None):
+    """
+    Plot market vs model 3D surfaces and residual bars.
+
+    Supports both old Stage-1 surface format (single matrix per method) and the
+    new multi-H format with explicit ['Expiry', strike..., 'H'] columns.
+
+    If multiple H slices are present in the model CSV and h_target is not
+    provided, the function selects the method-optimal H from stage1_parameters
+    (minimum RMSE_global_bps). If that file is unavailable, the first H is used.
+    """
     market_file = os.path.join(results_dir, 'stage1_surface_MARKET.csv')
     model_file = os.path.join(results_dir, f'stage1_surface_{method.upper()}.csv')
-    
+    if param_csv is None:
+        param_csv = os.path.join(results_dir, 'stage1_parameters.csv')
+
     if not os.path.exists(market_file) or not os.path.exists(model_file):
         print(f"Error: Could not find CSVs for {method}. Make sure they are in {results_dir}/")
         return
 
-    # 2. Load the data and convert to basis points (bps)
-    df_market = pd.read_csv(market_file, index_col=0) * 10000.0
-    df_model = pd.read_csv(model_file, index_col=0) * 10000.0
-    
+    # Market surface keeps the original matrix format (index=Expiry, columns=Strike)
+    df_market = pd.read_csv(market_file, index_col=0)
+
+    # Model surface can be old (matrix) or new (long-ish with H and Expiry columns)
+    df_model_raw = pd.read_csv(model_file)
+
+    if 'H' in df_model_raw.columns and 'Expiry' in df_model_raw.columns:
+        available_h = sorted(df_model_raw['H'].astype(float).unique())
+
+        selected_h = h_target
+        if selected_h is None:
+            if os.path.exists(param_csv):
+                params_df = pd.read_csv(param_csv)
+                subset = params_df[params_df['Method'].str.upper() == method.upper()].copy()
+                if not subset.empty and 'RMSE_global_bps' in subset.columns:
+                    best_row = subset.loc[subset['RMSE_global_bps'].idxmin()]
+                    selected_h = float(best_row['H'])
+                    print(f"[plot_true_3d_surfaces] Auto-selected optimal H={selected_h:.3f} from {param_csv}.")
+
+        if selected_h is None:
+            selected_h = float(available_h[0])
+            print(f"[plot_true_3d_surfaces] No h_target/optimal CSV found, using first available H={selected_h:.3f}.")
+
+        h_match = df_model_raw[np.isclose(df_model_raw['H'].astype(float).values, float(selected_h), atol=1e-8)]
+        if h_match.empty:
+            raise ValueError(f"Requested H={selected_h} not found in {model_file}. Available H: {available_h}")
+
+        # Reconstruct matrix shape to align with market matrix
+        h_match = h_match.sort_values('Expiry').copy()
+        strike_cols = [c for c in h_match.columns if c not in ['Expiry', 'H']]
+        df_model = h_match.set_index('Expiry')[strike_cols]
+
+        # Normalize axis dtypes for robust alignment
+        df_model.index = df_model.index.astype(float)
+        df_model.columns = df_model.columns.astype(float)
+        df_market.index = df_market.index.astype(float)
+        df_market.columns = df_market.columns.astype(float)
+
+        # Strict alignment to common grid
+        common_expiries = sorted(set(df_market.index).intersection(set(df_model.index)))
+        common_strikes = sorted(set(df_market.columns).intersection(set(df_model.columns)))
+        if len(common_expiries) == 0 or len(common_strikes) == 0:
+            raise ValueError("No overlapping expiry/strike grid between market and model surfaces.")
+
+        df_market = df_market.loc[common_expiries, common_strikes]
+        df_model = df_model.loc[common_expiries, common_strikes]
+        method_title = f"{method} | H={float(selected_h):.3f}"
+    else:
+        # Backward compatible path for old matrix-format model CSV
+        df_model = pd.read_csv(model_file, index_col=0)
+        method_title = method
+
+    # Convert vols to bps
+    df_market = df_market * 10000.0
+    df_model = df_model * 10000.0
+
     expiries = df_market.index.values.astype(float)
-    strikes = df_market.columns.values.astype(float) * 10000.0 # strikes in bps
-    
-    # Calculate Residuals (Model - Market)
+    strikes = df_market.columns.values.astype(float) * 10000.0
+
     df_res = df_model - df_market
     rmse = np.sqrt(np.nanmean(df_res.values**2))
-    
-    # Shared limits and Meshgrid for all 3D plots
+
     vmin = min(np.nanmin(df_market.values), np.nanmin(df_model.values))
     vmax = max(np.nanmax(df_market.values), np.nanmax(df_model.values))
     X, Y = np.meshgrid(strikes, expiries)
-    
-    # 3. Set up the Figure (wider to accommodate three 3D axes gracefully)
+
     fig = plt.figure(figsize=(24, 7))
-    
-    # Define a shared viewing angle for consistency
     view_elev = 25
     view_azim = -125
-    
-    # --- PANEL 1: MARKET SURFACE (True 3D Surface) ---
+
     ax1 = fig.add_subplot(1, 3, 1, projection='3d')
-    surf1 = ax1.plot_surface(X, Y, df_market.values, cmap='viridis', 
+    surf1 = ax1.plot_surface(X, Y, df_market.values, cmap='viridis',
                              vmin=vmin, vmax=vmax, edgecolor='none', alpha=0.85)
     ax1.set_title("Market Volatility Surface", fontsize=14, fontweight='bold')
     ax1.set_xlabel("\nStrike Offset (bps)", fontsize=11)
@@ -373,57 +412,49 @@ def plot_true_3d_surfaces(method='PURE_MC', results_dir='results'):
     ax1.view_init(elev=view_elev, azim=view_azim)
     fig.colorbar(surf1, ax=ax1, shrink=0.5, aspect=10, label='Normal Volatility (bps)')
 
-    # --- PANEL 2: MODEL SURFACE (True 3D Surface) ---
     ax2 = fig.add_subplot(1, 3, 2, projection='3d')
-    surf2 = ax2.plot_surface(X, Y, df_model.values, cmap='viridis', 
+    surf2 = ax2.plot_surface(X, Y, df_model.values, cmap='viridis',
                              vmin=vmin, vmax=vmax, edgecolor='none', alpha=0.85)
-    ax2.set_title(f"Model Surface ({method})", fontsize=14, fontweight='bold')
+    ax2.set_title(f"Model Surface ({method_title})", fontsize=14, fontweight='bold')
     ax2.set_xlabel("\nStrike Offset (bps)", fontsize=11)
     ax2.set_ylabel("\nExpiry (Years)", fontsize=11)
     ax2.set_zlabel("\nNormal Vol (bps)", fontsize=11)
     ax2.view_init(elev=view_elev, azim=view_azim)
     fig.colorbar(surf2, ax=ax2, shrink=0.5, aspect=10, label='Normal Volatility (bps)')
 
-    # --- PANEL 3: RESIDUALS (3D Bar Chart) ---
     ax3 = fig.add_subplot(1, 3, 3, projection='3d')
-    
-    # Prepare the 3D grid flattening for the bar chart
     X_flat = X.flatten()
     Y_flat = Y.flatten()
     Z_flat = np.zeros_like(X_flat)
     dZ_flat = df_res.values.flatten()
-    
-    # Filter out NaNs for the 3D plot
+
     valid_mask = ~np.isnan(dZ_flat)
     X_valid = X_flat[valid_mask]
     Y_valid = Y_flat[valid_mask]
     Z_valid = Z_flat[valid_mask]
     dZ_valid = dZ_flat[valid_mask]
-    
-    # Create a custom colormap for the bars (Red for positive error, Blue for negative)
+
     norm = mcolors.TwoSlopeNorm(vmin=min(dZ_valid.min(), -1), vcenter=0, vmax=max(dZ_valid.max(), 1))
     colors = cm.RdBu_r(norm(dZ_valid))
-    
-    # Dimensions of the bars
+
     dx = np.full_like(X_valid, (strikes[-1] - strikes[0]) / (len(strikes) * 1.5))
     dy = np.full_like(Y_valid, (expiries[-1] - expiries[0]) / (len(expiries) * 1.5))
-    
-    # Plot the 3D bars
+
     ax3.bar3d(X_valid, Y_valid, Z_valid, dx, dy, dZ_valid, color=colors, shade=True, alpha=0.9)
-    
+
     ax3.set_title(f"Residuals (RMSE: {rmse:.2f} bps)", fontsize=14, fontweight='bold')
     ax3.set_xlabel("\nStrike Offset (bps)", fontsize=11)
     ax3.set_ylabel("\nExpiry (Years)", fontsize=11)
     ax3.set_zlabel("\nError (bps)", fontsize=11)
     ax3.view_init(elev=view_elev, azim=view_azim)
-    
-    # Final layout adjustments
+
     plt.tight_layout()
     save_path = os.path.join(results_dir, f'vol_surface_3d_comparison_{method}.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
-    
+
     print(f"Awesome! Saved fully 3D plot to {save_path}")
+
 
 
 # 5. SURFACES OVERLEAF
@@ -660,22 +691,14 @@ def print_stage2_latex_performance(perf_csv="results/stage2_performance.csv"):
 # ========================================================================
 if __name__ == '__main__':
     # STAGE 1
-    generate_stage1_results()
+    # generate_stage1_results()
     print_full_latex_longtable()
-    plot_parameter_grid()
-    plot_true_3d_surfaces(method='PURE_MC')
+    # plot_parameter_grid()
+    # plot_true_3d_surfaces(method='AMMO_ODE')
 
     # STAGE 2
-    # Test Subtask 1 on the H you already have
-    # test_H = 0.05 
-    # print(f"Testing Model Reconstruction for H={test_H}...")
-    # calibrator = setup_stage2_calibrator_for_H(test_H)
-    # print("Successfully instantiated CorrelationCalibrator!")
-    # print(f"Target ATM Matrix shape: {calibrator.market_vols.shape}")
-    
+    test_H = 0.05    
     # generate_stage2_results()
-
-    # test_h = 0.05 
-    # # plot_stage2_correlation(h_target=test_h)
+    # plot_stage2_correlation(h_target=test_H)
     # print_stage2_latex_performance()
     
