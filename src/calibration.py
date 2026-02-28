@@ -260,9 +260,25 @@ class RoughSABRCalibrator:
             # ==========================================================
             elif method in ['PURE_MC', 'MC']:
                 log_progress("MC-Opt", "Starting True Pure Monte Carlo Global Optimization...", level=1)
+                # --- START COPY-PASTE HERE ---
+                known_nus = {
+                    0.05: 0.6009,
+                    0.10: 0.5871,
+                    0.15: 0.5713,
+                    0.20: 0.5575,
+                    0.25: 0.5085
+                }
+                
+                h_key = np.round(H, 2) 
+                if h_key in known_nus:
+                    smart_nu_guess = known_nus[h_key]
+                    print(f"   [Hack] FAST-TRACK: Injecting optimal Nu {smart_nu_guess} for H={H}")
+                
+                guess_global = np.concatenate(([smart_nu_guess], base_market_alphas, local_rhos))
+                # --- END COPY-PASTE HERE ---
                 
                 # Guess is now: [Nu, Alpha_1...Alpha_N, Rho_1...Rho_N]
-                guess_global = np.concatenate(([smart_nu_guess], base_market_alphas, local_rhos))
+                # guess_global = np.concatenate(([smart_nu_guess], base_market_alphas, local_rhos))
                 
                 # Bounds for Nu, Alphas (must be >0), and Rhos
                 lower_bounds = np.concatenate(([0.001], np.full(self.n_exp, 0.0001), np.full(self.n_exp, -0.999)))

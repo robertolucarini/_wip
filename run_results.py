@@ -358,7 +358,6 @@ def plot_true_3d_surfaces(method='PURE_MC', results_dir='results'):
 # ========================================================================
 if __name__ == '__main__':
     generate_stage1_results()
-    # print_full_latex_longtable()
-    # plot_parameter_grid()
-    # plot_true_3d_surfaces(method='PURE_MC')
-    # export_latex_surface_data(method='PURE_MC')
+    print_full_latex_longtable()
+    plot_parameter_grid()
+    plot_true_3d_surfaces(method='PURE_MC')
