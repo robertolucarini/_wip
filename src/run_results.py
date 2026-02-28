@@ -100,5 +100,83 @@ def generate_stage1_results(methods=['polynomial', 'AMMO_ODE', 'PURE_MC']):
         print(f"Saved all parameters to {params_path}")
         print("Done! You are ready to generate tables.")
 
+import pandas as pd
+import numpy as np
+
+def print_full_latex_longtable(csv_path="results/stage1_parameters.csv"):
+    df = pd.read_csv(csv_path)
+    
+    # Get all unique expiries sorted automatically!
+    all_expiries = sorted(df['Expiry'].unique())
+    
+    latex = []
+    
+    # We use longtable so it breaks beautifully across pages in the PDF
+    latex.append(r"\begin{center}")
+    latex.append(r"\small")
+    latex.append(r"\begin{longtable}{l l c c c c c}")
+    latex.append(r"    \caption{Comparison of calibrated marginal parameters (Stage 1) across the full yield curve. PURE\_MC successfully untraps the volatility-of-volatility parameter ($\nu$) from the asymptotic ODE breakdown.} \label{tab:stage1_full_comparison} \\")
+    latex.append(r"    \toprule")
+    latex.append(r"    \textbf{Expiry} & \textbf{Method} & \textbf{$\alpha$ (bps)} & \textbf{$\rho$} & \textbf{$\nu$} & \textbf{Global $H$} & \textbf{RMSE (bps)} \\")
+    latex.append(r"    \midrule")
+    latex.append(r"    \endfirsthead")
+    latex.append(r"")
+    latex.append(r"    % Header for subsequent pages")
+    latex.append(r"    \multicolumn{7}{c}%")
+    latex.append(r"    {{\bfseries \tablename\ \thetable{} -- continued from previous page}} \\")
+    latex.append(r"    \toprule")
+    latex.append(r"    \textbf{Expiry} & \textbf{Method} & \textbf{$\alpha$ (bps)} & \textbf{$\rho$} & \textbf{$\nu$} & \textbf{Global $H$} & \textbf{RMSE (bps)} \\")
+    latex.append(r"    \midrule")
+    latex.append(r"    \endhead")
+    latex.append(r"")
+    latex.append(r"    \midrule")
+    latex.append(r"    \multicolumn{7}{r}{{Continued on next page}} \\")
+    latex.append(r"    \endfoot")
+    latex.append(r"")
+    latex.append(r"    \bottomrule")
+    latex.append(r"    \endlastfoot")
+    latex.append(r"")
+    
+    for exp in all_expiries:
+        subset = df[np.isclose(df['Expiry'], exp)]
+        if subset.empty:
+            continue
+            
+        first = True
+        for _, row in subset.iterrows():
+            # Only print the expiry on the first row of the group
+            exp_str = f"{exp:.1f}Y" if first else ""
+            method_str = str(row['Method']).replace('_', '\\_')
+            
+            # Format the numbers perfectly
+            alpha_bps = row['Alpha'] * 10000.0
+            alpha_str = f"{alpha_bps:.1f}"
+            rho_str = f"{row['Rho']:.3f}"
+            nu_str = f"{row['Nu']:.4f}"
+            h_str = f"{row['H']:.3f}"
+            rmse_str = f"{row['RMSE_bps']:.2f}"
+            
+            # Highlight your PURE_MC breakthrough in bold
+            if row['Method'] == 'PURE_MC':
+                method_str = f"\textbf{{{method_str}}}"
+                nu_str = f"\textbf{{{nu_str}}}"
+                
+            latex.append(f"    {exp_str} & {method_str} & {alpha_str} & {rho_str} & {nu_str} & {h_str} & {rmse_str} \\\\")
+            first = False
+            
+        latex.append(r"    \midrule")
+        
+    # Remove the last midrule to make it look clean against the bottomrule
+    if latex[-1].strip() == r"\midrule":
+        latex.pop()
+        
+    latex.append(r"\end{longtable}")
+    latex.append(r"\end{center}")
+    
+    print("\n".join(latex))
+
+
+
 if __name__ == '__main__':
     generate_stage1_results()
+    # print_full_latex_longtable()
