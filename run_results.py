@@ -249,7 +249,7 @@ def plot_parameter_grid(csv_path="results/stage1_parameters.csv", save_path="res
 
 
 # 4. VOL SURFACE CHARTS
-def plot_volatility_surfaces(method='PURE_MC', results_dir='results'):
+def plot_true_3d_surfaces(method='PURE_MC', results_dir='results'):
     # 1. Define file paths
     market_file = os.path.join(results_dir, 'stage1_surface_MARKET.csv')
     model_file = os.path.join(results_dir, f'stage1_surface_{method.upper()}.csv')
@@ -269,37 +269,46 @@ def plot_volatility_surfaces(method='PURE_MC', results_dir='results'):
     df_res = df_model - df_market
     rmse = np.sqrt(np.nanmean(df_res.values**2))
     
-    # 3. Set up the Figure with mixed 2D and 3D axes
-    fig = plt.figure(figsize=(20, 6))
-    
-    # Shared limits for the heatmaps
+    # Shared limits and Meshgrid for all 3D plots
     vmin = min(np.nanmin(df_market.values), np.nanmin(df_model.values))
     vmax = max(np.nanmax(df_market.values), np.nanmax(df_model.values))
-    extent = [strikes[0], strikes[-1], expiries[-1], expiries[0]]
+    X, Y = np.meshgrid(strikes, expiries)
     
-    # --- PANEL 1: MARKET SURFACE (2D Heatmap) ---
-    ax1 = fig.add_subplot(1, 3, 1)
-    im1 = ax1.imshow(df_market.values, aspect='auto', cmap='viridis', extent=extent, vmin=vmin, vmax=vmax)
+    # 3. Set up the Figure (wider to accommodate three 3D axes gracefully)
+    fig = plt.figure(figsize=(24, 7))
+    
+    # Define a shared viewing angle for consistency
+    view_elev = 25
+    view_azim = -125
+    
+    # --- PANEL 1: MARKET SURFACE (True 3D Surface) ---
+    ax1 = fig.add_subplot(1, 3, 1, projection='3d')
+    surf1 = ax1.plot_surface(X, Y, df_market.values, cmap='viridis', 
+                             vmin=vmin, vmax=vmax, edgecolor='none', alpha=0.85)
     ax1.set_title("Market Volatility Surface", fontsize=14, fontweight='bold')
-    ax1.set_xlabel("Strike Offset (bps)", fontsize=12)
-    ax1.set_ylabel("Expiry (Years)", fontsize=12)
-    fig.colorbar(im1, ax=ax1, label='Normal Volatility (bps)')
+    ax1.set_xlabel("\nStrike Offset (bps)", fontsize=11)
+    ax1.set_ylabel("\nExpiry (Years)", fontsize=11)
+    ax1.set_zlabel("\nNormal Vol (bps)", fontsize=11)
+    ax1.view_init(elev=view_elev, azim=view_azim)
+    fig.colorbar(surf1, ax=ax1, shrink=0.5, aspect=10, label='Normal Volatility (bps)')
 
-    # --- PANEL 2: MODEL SURFACE (2D Heatmap) ---
-    ax2 = fig.add_subplot(1, 3, 2)
-    im2 = ax2.imshow(df_model.values, aspect='auto', cmap='viridis', extent=extent, vmin=vmin, vmax=vmax)
+    # --- PANEL 2: MODEL SURFACE (True 3D Surface) ---
+    ax2 = fig.add_subplot(1, 3, 2, projection='3d')
+    surf2 = ax2.plot_surface(X, Y, df_model.values, cmap='viridis', 
+                             vmin=vmin, vmax=vmax, edgecolor='none', alpha=0.85)
     ax2.set_title(f"Model Surface ({method})", fontsize=14, fontweight='bold')
-    ax2.set_xlabel("Strike Offset (bps)", fontsize=12)
-    ax2.set_ylabel("Expiry (Years)", fontsize=12)
-    fig.colorbar(im2, ax=ax2, label='Normal Volatility (bps)')
+    ax2.set_xlabel("\nStrike Offset (bps)", fontsize=11)
+    ax2.set_ylabel("\nExpiry (Years)", fontsize=11)
+    ax2.set_zlabel("\nNormal Vol (bps)", fontsize=11)
+    ax2.view_init(elev=view_elev, azim=view_azim)
+    fig.colorbar(surf2, ax=ax2, shrink=0.5, aspect=10, label='Normal Volatility (bps)')
 
     # --- PANEL 3: RESIDUALS (3D Bar Chart) ---
     ax3 = fig.add_subplot(1, 3, 3, projection='3d')
     
-    # Prepare the 3D grid
-    _X, _Y = np.meshgrid(strikes, expiries)
-    X_flat = _X.flatten()
-    Y_flat = _Y.flatten()
+    # Prepare the 3D grid flattening for the bar chart
+    X_flat = X.flatten()
+    Y_flat = Y.flatten()
     Z_flat = np.zeros_like(X_flat)
     dZ_flat = df_res.values.flatten()
     
@@ -325,21 +334,18 @@ def plot_volatility_surfaces(method='PURE_MC', results_dir='results'):
     ax3.set_xlabel("\nStrike Offset (bps)", fontsize=11)
     ax3.set_ylabel("\nExpiry (Years)", fontsize=11)
     ax3.set_zlabel("\nError (bps)", fontsize=11)
-    
-    # Improve 3D viewing angle
-    ax3.view_init(elev=30, azim=-125)
+    ax3.view_init(elev=view_elev, azim=view_azim)
     
     # Final layout adjustments
     plt.tight_layout()
-    save_path = os.path.join(results_dir, f'vol_surface_comparison_{method}.png')
+    save_path = os.path.join(results_dir, f'vol_surface_3d_comparison_{method}.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
     
-    print(f"Awesome! Saved 3-panel plot to {save_path}")
+    print(f"Awesome! Saved fully 3D plot to {save_path}")
 
 
-
-
+# 5. SURFACES OVERLEAF
 # ========================================================================
 # Calibration Stage 2
 # ========================================================================
@@ -351,7 +357,8 @@ def plot_volatility_surfaces(method='PURE_MC', results_dir='results'):
 # Execution
 # ========================================================================
 if __name__ == '__main__':
-    # generate_stage1_results()
+    generate_stage1_results()
     # print_full_latex_longtable()
     # plot_parameter_grid()
-    plot_volatility_surfaces(method='PURE_MC')
+    # plot_true_3d_surfaces(method='PURE_MC')
+    # export_latex_surface_data(method='PURE_MC')
