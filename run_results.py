@@ -10,6 +10,12 @@ from src.calibration import RoughSABRCalibrator
 from config import H_GRID
 from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.colors as mcolors
+from scipy.interpolate import PchipInterpolator
+from src.utils import load_discount_curve, bootstrap_forward_rates
+from src.torch_model import TorchRoughSABR_FMM
+from src.calibration import CorrelationCalibrator
+from main import load_atm_matrix
+from config import BETA_SABR, SHIFT_SABR
 
 
 
@@ -111,10 +117,20 @@ def generate_stage1_results(methods=['polynomial', 'AMMO_ODE', 'PURE_MC']):
 
 
 # 2. LATEX TABLE
+# 2. LATEX TABLE
 def print_full_latex_longtable(csv_path="results/stage1_parameters.csv"):
+    if not os.path.exists(csv_path):
+        print(f"Error: {csv_path} not found.")
+        return
+        
     df = pd.read_csv(csv_path)
     
-    # Get all unique expiries sorted automatically!
+    # THE FIX: Round the floats to eliminate precision mismatch!
+    df['H'] = df['H'].round(3)
+    df['Expiry'] = df['Expiry'].round(3)
+    
+    # Get all unique H and expiries, sorted
+    all_Hs = sorted(df['H'].unique())
     all_expiries = sorted(df['Expiry'].unique())
     
     latex = []
@@ -122,10 +138,12 @@ def print_full_latex_longtable(csv_path="results/stage1_parameters.csv"):
     # We use longtable so it breaks beautifully across pages in the PDF
     latex.append(r"\begin{center}")
     latex.append(r"\small")
-    latex.append(r"\begin{longtable}{l l c c c c c}")
-    latex.append(r"    \caption{Comparison of calibrated marginal parameters (Stage 1) across the full yield curve. PURE\_MC successfully untraps the volatility-of-volatility parameter ($\nu$) from the asymptotic ODE breakdown.} \label{tab:stage1_full_comparison} \\")
+    latex.append(r"\begin{longtable}{c c c c c c c}")
+    latex.append(r"    \caption{Comparison of calibrated marginal parameters (Stage 1). PURE\_MC successfully untraps the volatility-of-volatility parameter ($\nu$) from the asymptotic ODE breakdown, resulting in significantly lower RMSE.} \label{tab:stage1_full_comparison} \\")
     latex.append(r"    \toprule")
-    latex.append(r"    \textbf{Expiry} & \textbf{Method} & \textbf{$\alpha$ (bps)} & \textbf{$\rho$} & \textbf{$\nu$} & \textbf{Global $H$} & \textbf{RMSE (bps)} \\")
+    latex.append(r"    & \multicolumn{2}{c}{\textbf{$\alpha$ (bps)}} & \multicolumn{2}{c}{\textbf{$\rho$}} & \multicolumn{2}{c}{\textbf{RMSE (bps)}} \\")
+    latex.append(r"    \cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7}")
+    latex.append(r"    \textbf{Expiry} & \textbf{MC} & \textbf{ODE} & \textbf{MC} & \textbf{ODE} & \textbf{MC} & \textbf{ODE} \\")
     latex.append(r"    \midrule")
     latex.append(r"    \endfirsthead")
     latex.append(r"")
@@ -133,7 +151,9 @@ def print_full_latex_longtable(csv_path="results/stage1_parameters.csv"):
     latex.append(r"    \multicolumn{7}{c}%")
     latex.append(r"    {{\bfseries \tablename\ \thetable{} -- continued from previous page}} \\")
     latex.append(r"    \toprule")
-    latex.append(r"    \textbf{Expiry} & \textbf{Method} & \textbf{$\alpha$ (bps)} & \textbf{$\rho$} & \textbf{$\nu$} & \textbf{Global $H$} & \textbf{RMSE (bps)} \\")
+    latex.append(r"    & \multicolumn{2}{c}{\textbf{$\alpha$ (bps)}} & \multicolumn{2}{c}{\textbf{$\rho$}} & \multicolumn{2}{c}{\textbf{RMSE (bps)}} \\")
+    latex.append(r"    \cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7}")
+    latex.append(r"    \textbf{Expiry} & \textbf{MC} & \textbf{ODE} & \textbf{MC} & \textbf{ODE} & \textbf{MC} & \textbf{ODE} \\")
     latex.append(r"    \midrule")
     latex.append(r"    \endhead")
     latex.append(r"")
@@ -145,33 +165,69 @@ def print_full_latex_longtable(csv_path="results/stage1_parameters.csv"):
     latex.append(r"    \endlastfoot")
     latex.append(r"")
     
-    for exp in all_expiries:
-        subset = df[np.isclose(df['Expiry'], exp)]
-        if subset.empty:
+    for h in all_Hs:
+        # Now we can safely use direct equality
+        subset_h = df[df['H'] == h]
+        if subset_h.empty:
             continue
             
+        # Extract global Nu for the subheader
+        mc_nu_row = subset_h[subset_h['Method'] == 'PURE_MC']
+        ode_nu_row = subset_h[subset_h['Method'] == 'AMMO_ODE']
+        
+        mc_nu = mc_nu_row['Nu'].iloc[0] if not mc_nu_row.empty else np.nan
+        ode_nu = ode_nu_row['Nu'].iloc[0] if not ode_nu_row.empty else np.nan
+        
+        mc_nu_str = f"{mc_nu:.4f}" if not np.isnan(mc_nu) else "N/A"
+        ode_nu_str = f"{ode_nu:.4f}" if not np.isnan(ode_nu) else "N/A"
+        
+        # Add the H subheader with the global Nu values
+        latex.append(f"    \\multicolumn{{7}}{{l}}{{\\textbf{{$H = {h:.2f}$}} \\quad (Global $\\nu$: MC = {mc_nu_str}, ODE = {ode_nu_str})}} \\\\")
+        latex.append(r"    \midrule")
+        
         first = True
-        for _, row in subset.iterrows():
-            # Only print the expiry on the first row of the group
-            exp_str = f"{exp:.1f}Y" if first else ""
-            method_str = str(row['Method']).replace('_', '\\_')
-            
-            # Format the numbers perfectly
-            alpha_bps = row['Alpha'] * 10000.0
-            alpha_str = f"{alpha_bps:.1f}"
-            rho_str = f"{row['Rho']:.3f}"
-            nu_str = f"{row['Nu']:.4f}"
-            h_str = f"{row['H']:.3f}"
-            rmse_str = f"{row['RMSE_bps']:.2f}"
-            
-            # Highlight your PURE_MC breakthrough in bold
-            if row['Method'] == 'PURE_MC':
-                method_str = f"\textbf{{{method_str}}}"
-                nu_str = f"\textbf{{{nu_str}}}"
+        for exp in all_expiries:
+            subset_exp = subset_h[subset_h['Expiry'] == exp]
+            if subset_exp.empty:
+                continue
                 
-            latex.append(f"    {exp_str} & {method_str} & {alpha_str} & {rho_str} & {nu_str} & {h_str} & {rmse_str} \\\\")
-            first = False
+            mc_row = subset_exp[subset_exp['Method'] == 'PURE_MC']
+            ode_row = subset_exp[subset_exp['Method'] == 'AMMO_ODE']
             
+            # --- Format MC Values ---
+            if not mc_row.empty:
+                mc_alpha = f"{mc_row['Alpha'].values[0] * 10000.0:.1f}"
+                mc_rho = f"{mc_row['Rho'].values[0]:.3f}"
+                mc_rmse_val = mc_row['RMSE_bps'].values[0]
+                mc_rmse = f"{mc_rmse_val:.2f}"
+            else:
+                mc_alpha, mc_rho, mc_rmse_val, mc_rmse = "-", "-", np.inf, "-"
+                
+            # --- Format ODE Values ---
+            if not ode_row.empty:
+                ode_alpha = f"{ode_row['Alpha'].values[0] * 10000.0:.1f}"
+                ode_rho = f"{ode_row['Rho'].values[0]:.3f}"
+                ode_rmse_val = ode_row['RMSE_bps'].values[0]
+                ode_rmse = f"{ode_rmse_val:.2f}"
+            else:
+                ode_alpha, ode_rho, ode_rmse_val, ode_rmse = "-", "-", np.inf, "-"
+                
+            # --- Bold the winning RMSE ---
+            if not mc_row.empty and not ode_row.empty:
+                if mc_rmse_val < ode_rmse_val:
+                    mc_rmse = f"\\textbf{{{mc_rmse}}}"
+                elif ode_rmse_val < mc_rmse_val:
+                    ode_rmse = f"\\textbf{{{ode_rmse}}}"
+            
+            exp_str = f"{exp:.1f}Y"
+            
+            # Print RMSE only on the first row of the block to keep the table clean
+            if first:
+                latex.append(f"    {exp_str} & {mc_alpha} & {ode_alpha} & {mc_rho} & {ode_rho} & {mc_rmse} & {ode_rmse} \\\\")
+                first = False
+            else:
+                latex.append(f"    {exp_str} & {mc_alpha} & {ode_alpha} & {mc_rho} & {ode_rho} & & \\\\")
+                
         latex.append(r"    \midrule")
         
     # Remove the last midrule to make it look clean against the bottomrule
@@ -182,7 +238,7 @@ def print_full_latex_longtable(csv_path="results/stage1_parameters.csv"):
     latex.append(r"\end{center}")
     
     print("\n".join(latex))
-
+    
 
 # 3. PARAMETERS CHARTS
 def plot_parameter_grid(csv_path="results/stage1_parameters.csv", save_path="results/stage1_parameters_grid.png"):
@@ -346,18 +402,255 @@ def plot_true_3d_surfaces(method='PURE_MC', results_dir='results'):
 
 
 # 5. SURFACES OVERLEAF
+
+
+
 # ========================================================================
 # Calibration Stage 2
 # ========================================================================
+# DATA PREP
+def setup_stage2_calibrator_for_H(h_target, param_csv="results/stage1_parameters.csv"):
+    """
+    Subtask 1: Data Ingestion & Model Initialization.
+    Reconstructs the PyTorch model with FLAT EXTRAPOLATION to prevent 
+    short-end polynomial blowups on the uncalibrated spot rate.
+    """
+    if not os.path.exists(param_csv):
+        raise FileNotFoundError(f"Cannot find {param_csv}. Run Stage 1 first.")
+        
+    df = pd.read_csv(param_csv)
+    subset = df[(np.isclose(df['H'], h_target)) & (df['Method'] == 'PURE_MC')].sort_values('Expiry')
+    
+    if subset.empty:
+        raise ValueError(f"No PURE_MC parameters found for H={h_target} in {param_csv}")
+        
+    expiries = subset['Expiry'].values
+    alphas = subset['Alpha'].values
+    rhos = subset['Rho'].values
+    nus = subset['Nu'].values
+    
+    # --- THE FIX: FLAT EXTRAPOLATION WRAPPER ---
+    min_T, max_T = expiries.min(), expiries.max()
+    
+    base_alpha = PchipInterpolator(expiries, alphas)
+    base_rho = PchipInterpolator(expiries, rhos)
+    base_nu = PchipInterpolator(expiries, nus)
+    
+    # By clipping the input 't' to the valid domain, we force the function 
+    # to flat-line outside the bounds instead of shooting to infinity.
+    alpha_func = lambda t: base_alpha(np.clip(t, min_T, max_T))
+    rho_func = lambda t: base_rho(np.clip(t, min_T, max_T))
+    nu_func = lambda t: base_nu(np.clip(t, min_T, max_T))
+    # -------------------------------------------
+    
+    ois_func = load_discount_curve("data/estr_disc.csv")
+    grid_T, F0_rates = bootstrap_forward_rates(ois_func)
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model_base = TorchRoughSABR_FMM(
+        grid_T, F0_rates, alpha_func, rho_func, nu_func, h_target, 
+        beta_sabr=BETA_SABR, shift=SHIFT_SABR, correlation_mode='full', device=device
+    )
+    
+    atm_matrix = load_atm_matrix("data/estr_vol_full_strikes.csv")
+    corr_calibrator = CorrelationCalibrator(atm_matrix, model_base)
+    
+    return corr_calibrator
 
 
+# STAGE 2 RESULTS
+def generate_stage2_results(param_csv="results/stage1_parameters.csv"):
+    """
+    Subtask 2: Matrix AMMO Execution Loop.
+    Iterates through all optimal H values found in Stage 1, runs the AAD-based 
+    correlation calibration, and saves the final matrices and timing benchmarks.
+    """
+    print("\n" + "="*60)
+    print(f"{'STAGE 2: SPATIAL CORRELATION CALIBRATION (MATRIX AMMO)':^60}")
+    print("="*60)
+    
+    if not os.path.exists(param_csv):
+        print(f"Error: {param_csv} not found. Please run Stage 1 first.")
+        return
+        
+    df = pd.read_csv(param_csv)
+    
+    # Isolate the Pure MC results and find all unique H values
+    mc_df = df[df['Method'] == 'PURE_MC']
+    if mc_df.empty:
+        print("No PURE_MC results found in Stage 1 parameters. Check Stage 1 output.")
+        return
+        
+    unique_Hs = sorted(mc_df['H'].unique())
+    print(f"Found {len(unique_Hs)} Hurst exponent(s) to process: {unique_Hs}\n")
+    
+    performance_records = []
+    
+    for h in unique_Hs:
+        print(f">>> Starting Matrix AMMO for H = {h:.3f} <<<")
+        try:
+            # 1. Reconstruct the model and calibrator for this specific H
+            calibrator = setup_stage2_calibrator_for_H(h, param_csv)
+            
+            # 2. Run the AMMO Calibration and strictly time it
+            t0 = time.time()
+            corr_res = calibrator.calibrate()
+            ammo_time = time.time() - t0
+            
+            # 3. Extract the final calibrated correlation matrix (Sigma)
+            sigma_matrix = corr_res['Sigma_matrix']
+            
+            # 4. Save the matrix to CSV
+            # Shape is (N+1) x (N+1), where index 0 is the Volatility driver Z(t), 
+            # and indices 1 to N are the forward rates F_i(t)
+            df_sigma = pd.DataFrame(sigma_matrix)
+            sigma_path = f"results/stage2_correlation_H_{h:.3f}.csv"
+            df_sigma.to_csv(sigma_path, index=False, header=False)
+            
+            print(f"-> Saved Calibrated Correlation Matrix to {sigma_path}")
+            
+            # 5. Record performance for the benchmark table
+            performance_records.append({
+                'H': h,
+                'AMMO_Time_Seconds': ammo_time,
+                'Matrix_Size': f"{sigma_matrix.shape[0]}x{sigma_matrix.shape[1]}"
+            })
+            
+        except Exception as e:
+            print(f"-> FAILED to process H={h}: {e}")
+            
+    # 6. Save the master performance benchmark table
+    if performance_records:
+        df_perf = pd.DataFrame(performance_records)
+        perf_path = "results/stage2_performance.csv"
+        df_perf.to_csv(perf_path, index=False)
+        print(f"\nSaved AMMO performance benchmarks to {perf_path}")
+        
+    print("\nStage 2 Results Generation Complete!")
+
+
+# HEATMAPS
+def plot_stage2_correlation(h_target, results_dir='results'):
+    """
+    Subtask 3a: Correlation Matrix Visualization.
+    Plots the anatomical breakdown of the AMMO-calibrated Sigma Matrix.
+    """
+    sigma_path = os.path.join(results_dir, f"stage2_correlation_H_{h_target:.3f}.csv")
+    if not os.path.exists(sigma_path):
+        print(f"Error: {sigma_path} not found.")
+        return
+
+    # 1. Load the calibrated full (N+1) x (N+1) matrix
+    sigma = pd.read_csv(sigma_path, header=None).values
+
+    # 2. Get the tenors for axis labeling
+    from src.utils import load_discount_curve, bootstrap_forward_rates
+    ois_func = load_discount_curve("data/estr_disc.csv")
+    grid_T, _ = bootstrap_forward_rates(ois_func)
+    forward_tenors = grid_T[:-1]  # The N forward rate tenors
+
+    # 3. Setup the 3-panel figure
+    fig, axes = plt.subplots(1, 3, figsize=(20, 5.5))
+    
+    # --- PANEL 1: Forward-Forward Spatial Correlation Heatmap ---
+    ff_corr = sigma[1:, 1:] # Isolate the N x N forward rate block
+    im = axes[0].imshow(ff_corr, cmap='viridis', vmin=0.0, vmax=1.0, origin='upper', aspect='auto')
+    axes[0].set_title(f"Calibrated Spatial Correlation $\Sigma$ (H={h_target:.2f})", fontsize=14, fontweight='bold')
+    axes[0].set_xlabel("Forward Rate Index $T_j$", fontsize=12)
+    axes[0].set_ylabel("Forward Rate Index $T_i$", fontsize=12)
+    fig.colorbar(im, ax=axes[0], shrink=0.8, label="Correlation")
+
+    # --- PANEL 2: Correlation Decay Profile ---
+    # Plot how the 1Y Forward (Index 0) correlates with all subsequent forwards
+    axes[1].plot(forward_tenors, ff_corr[0, :], marker='o', lw=2, markersize=5, color='darkblue')
+    axes[1].fill_between(forward_tenors, ff_corr[0, :], 0, color='darkblue', alpha=0.1)
+    axes[1].set_title("Spatial Decay Profile (Base: 1Y Forward)", fontsize=14, fontweight='bold')
+    axes[1].set_xlabel("Maturity (Years)", fontsize=12)
+    axes[1].set_ylabel("Correlation with 1Y Fwd", fontsize=12)
+    axes[1].grid(True, alpha=0.4)
+    axes[1].set_ylim(0, 1.05)
+
+    # --- PANEL 3: Spot-Vol Leverage Check ---
+    # The 0th row/col of the full Sigma is the Volatility Driver Z(t)
+    spot_vol_corr = sigma[0, 1:]
+    axes[2].plot(forward_tenors, spot_vol_corr, marker='s', lw=2, markersize=5, color='darkred')
+    axes[2].set_title(r"Preserved Spot-Vol Skew $\rho(T_i)$", fontsize=14, fontweight='bold')
+    axes[2].set_xlabel("Maturity (Years)", fontsize=12)
+    axes[2].set_ylabel(r"Correlation $\rho$", fontsize=12)
+    axes[2].grid(True, alpha=0.4)
+    axes[2].set_ylim(-1.0, 1.0)
+    axes[2].axhline(0, color='black', lw=1, ls='--')
+
+    plt.tight_layout()
+    save_path = os.path.join(results_dir, f"stage2_visuals_H_{h_target:.3f}.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"Awesome! Saved Stage 2 Matrix Visuals to {save_path}")
+
+
+def print_stage2_latex_performance(perf_csv="results/stage2_performance.csv"):
+    """
+    Subtask 3b: LaTeX Benchmark Table Generation.
+    Prints the AAD execution speed table to copy directly into the paper.
+    """
+    if not os.path.exists(perf_csv):
+        return
+        
+    df = pd.read_csv(perf_csv)
+    
+    latex = [
+        r"\begin{table}[htbp]",
+        r"    \centering",
+        r"    \caption{Matrix AMMO Calibration Performance. Adjoint Algorithmic Differentiation computes the dense spatial Jacobian in a single backward pass, eliminating the $O(N^2)$ scaling penalty of traditional finite differences.}",
+        r"    \label{tab:ammo_performance}",
+        r"    \begin{tabular}{l c c c}",
+        r"        \toprule",
+        r"        \textbf{Hurst ($H$)} & \textbf{Matrix Size} & \textbf{Calibrated Angles} & \textbf{AMMO Execution Time (s)} \\",
+        r"        \midrule"
+    ]
+    
+    for _, row in df.iterrows():
+        size_str = row['Matrix_Size']
+        n_dim = int(size_str.split('x')[0])
+        # The number of free Rapisarda angles calibrated is roughly (N-2)(N-1)/2
+        n_angles = int((n_dim - 2) * (n_dim - 1) / 2)
+        
+        latex.append(f"        {row['H']:.3f} & {size_str} & {n_angles} & {row['AMMO_Time_Seconds']:.2f} \\\\")
+        
+    latex.extend([
+        r"        \bottomrule",
+        r"    \end{tabular}",
+        r"\end{table}"
+    ])
+    
+    print("\n" + "="*60)
+    print("STAGE 2 LATEX BENCHMARK TABLE")
+    print("="*60)
+    print("\n".join(latex))
+    print("="*60 + "\n")
 
 
 # ========================================================================
 # Execution
 # ========================================================================
 if __name__ == '__main__':
-    generate_stage1_results()
+    # STAGE 1
+    # generate_stage1_results()
     print_full_latex_longtable()
-    plot_parameter_grid()
-    plot_true_3d_surfaces(method='PURE_MC')
+    # plot_parameter_grid()
+    # plot_true_3d_surfaces(method='PURE_MC')
+
+    # STAGE 2
+    # Test Subtask 1 on the H you already have
+    # test_H = 0.05 
+    # print(f"Testing Model Reconstruction for H={test_H}...")
+    # calibrator = setup_stage2_calibrator_for_H(test_H)
+    # print("Successfully instantiated CorrelationCalibrator!")
+    # print(f"Target ATM Matrix shape: {calibrator.market_vols.shape}")
+    
+    # generate_stage2_results()
+
+    # test_h = 0.05 
+    # # plot_stage2_correlation(h_target=test_h)
+    # print_stage2_latex_performance()
+    
