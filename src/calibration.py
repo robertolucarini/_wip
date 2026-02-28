@@ -332,7 +332,7 @@ class RoughSABRCalibrator:
            
 
     def rough_sabr_vol_mc(self, k, T, alpha, rho, nu, H):
-        device = 'cpu'
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
         K_t = torch.tensor(k, device=device, dtype=torch.float64)
         T_t = torch.tensor(T, device=device, dtype=torch.float64)
         alpha_t = torch.tensor(alpha, device=device, dtype=torch.float64)
