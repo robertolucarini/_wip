@@ -18,7 +18,6 @@ from main import load_atm_matrix
 from config import BETA_SABR, SHIFT_SABR
 
 
-
 # ========================================================================
 # Calibration Stage 1
 # ========================================================================
@@ -27,87 +26,114 @@ def generate_stage1_results(methods=['polynomial', 'AMMO_ODE', 'PURE_MC']):
     """
     Runs Stage 1 calibration across multiple methods and stores the resulting 
     parameters and estimated volatility surfaces for later analysis.
+
+    Guarantees full storage per (method, H, expiry): Alpha, Rho, Nu,
+    expiry-level RMSE in bps, and fixed-H global RMSE in bps.
     """
-    # Create results directory to store outputs
     os.makedirs('results', exist_ok=True)
-    
-    # 1. Load Data (Targeting the 1Y underlying slice for Stage 1)
+
     print("Loading market data...")
     vol_matrix_1y = load_swaption_vol_surface("data/estr_vol_full_strikes.csv", 1.0)
     calibrator = RoughSABRCalibrator(vol_matrix_1y)
-    
+
     expiries = calibrator.expiries
     strikes = calibrator.strike_offsets
-    
-    # Save the market surface for reference
+    h_grid = np.array(H_GRID, dtype=float)
+
     market_path = "results/stage1_surface_MARKET.csv"
     vol_matrix_1y.to_csv(market_path)
     print(f"Saved market surface to {market_path}\n")
-    
+
+    market_matrix = vol_matrix_1y.loc[expiries, strikes].values
+    expected_rows_per_method = len(h_grid) * len(expiries)
+
     param_records = []
-    
+
     for method in methods:
         print(f"{'='*60}")
         print(f"Running Calibration: {method.upper()}")
         print(f"{'='*60}")
-        
-        try:
-            # 2. Run Calibration using your existing class
-            calib = calibrator.calibrate(method=method, H_grid=H_GRID)
-            
-            # 3. Extract Global and Local Parameters
-            H = calib['H']
-            rmse = calib['rmse_bps']
-            
+
+        method_surfaces = []
+        method_records = []
+        completed_h = []
+
+        for H in h_grid:
+            print(f"-> Calibrating {method.upper()} at fixed H={H:.3f}")
+            try:
+                calib = calibrator.calibrate(method=method, H_grid=np.array([H], dtype=float))
+            except Exception as e:
+                print(f"   !! FAILED at H={H:.3f} for {method.upper()}: {e}")
+                continue
+
+            solved_H = float(calib['H'])
+            rmse_global = float(calib['rmse_bps'])
+
+            T_grid, K_grid = np.meshgrid(expiries, strikes, indexing='ij')
+            T_flat = T_grid.flatten()
+            K_flat = K_grid.flatten()
+
+            a_flat = calib['alpha_func'](T_flat)
+            r_flat = calib['rho_func'](T_flat)
+            n_flat = calib['nu_func'](T_flat)
+
+            if method.upper() in ['PURE_MC', 'MC']:
+                vols_flat = calibrator.rough_sabr_vol_mc(K_flat, T_flat, a_flat, r_flat, n_flat, solved_H)
+            elif method.upper() == 'POLYNOMIAL':
+                vols_flat = calibrator.rough_sabr_vol(K_flat, T_flat, a_flat, r_flat, n_flat, solved_H)
+            else:
+                vols_flat = calibrator.rough_sabr_vol_ode(K_flat, T_flat, a_flat, r_flat, n_flat, solved_H)
+
+            vols_matrix = vols_flat.reshape(len(expiries), len(strikes))
+            df_surface_h = pd.DataFrame(vols_matrix, index=expiries, columns=strikes)
+            df_surface_h['H'] = solved_H
+            method_surfaces.append(df_surface_h.reset_index().rename(columns={'index': 'Expiry'}))
+
             alphas = calib['alpha_func'](expiries)
             rhos = calib['rho_func'](expiries)
-            
-            # nu_func might return a float or an array depending on your setup
             nus = calib['nu_func'](expiries)
             if isinstance(nus, (float, int)):
                 nus = np.full_like(expiries, nus)
-            
-            # Store parameters for table generation
+
+            expiry_rmse_bps = np.sqrt(np.mean(((vols_matrix - market_matrix) * 10000.0) ** 2, axis=1))
+
             for i, T in enumerate(expiries):
-                param_records.append({
+                method_records.append({
                     'Method': method,
+                    'H': solved_H,
                     'Expiry': T,
                     'Alpha': alphas[i],
                     'Rho': rhos[i],
                     'Nu': nus[i],
-                    'H': H,
-                    'RMSE_bps': rmse
+                    'RMSE_bps': expiry_rmse_bps[i],
+                    'RMSE_global_bps': rmse_global
                 })
-            
-            # 4. Generate Model Surface
-            T_grid, K_grid = np.meshgrid(expiries, strikes, indexing='ij')
-            T_flat = T_grid.flatten()
-            K_flat = K_grid.flatten()
-            
-            a_flat = calib['alpha_func'](T_flat)
-            r_flat = calib['rho_func'](T_flat)
-            n_flat = calib['nu_func'](T_flat)
-            
-            # Evaluate the surface using the appropriate evaluator
-            if method.upper() in ['PURE_MC', 'MC']:
-                vols_flat = calibrator.rough_sabr_vol_mc(K_flat, T_flat, a_flat, r_flat, n_flat, H)
-            elif method.upper() == 'POLYNOMIAL':
-                vols_flat = calibrator.rough_sabr_vol(K_flat, T_flat, a_flat, r_flat, n_flat, H)
-            else:
-                vols_flat = calibrator.rough_sabr_vol_ode(K_flat, T_flat, a_flat, r_flat, n_flat, H)
-            
-            # Reshape and save to CSV
-            vols_matrix = vols_flat.reshape(len(expiries), len(strikes))
-            df_surface = pd.DataFrame(vols_matrix, index=expiries, columns=strikes)
-            
+
+            completed_h.append(solved_H)
+
+        if method_surfaces:
+            df_surface = pd.concat(method_surfaces, ignore_index=True)
             surface_path = f"results/stage1_surface_{method.upper()}.csv"
-            df_surface.to_csv(surface_path)
-            print(f"-> Saved fitted surface to {surface_path}\n")
-            
-        except Exception as e:
-            print(f"-> FAILED to run {method}: {e}\n")
-    
-    # 5. Save all aggregated parameters to a single CSV
+            df_surface.to_csv(surface_path, index=False)
+            print(f"-> Saved fitted surfaces (all completed H) to {surface_path}")
+
+        if method_records:
+            param_records.extend(method_records)
+
+        # strict completeness check (important for long expensive runs)
+        unique_h = np.unique(np.round(completed_h, 6))
+        expected_h = np.unique(np.round(h_grid, 6))
+        missing_h = sorted(set(expected_h.tolist()) - set(unique_h.tolist()))
+
+        if len(method_records) != expected_rows_per_method or missing_h:
+            raise RuntimeError(
+                f"Stage1 results are incomplete for {method.upper()}: "
+                f"expected {expected_rows_per_method} rows, got {len(method_records)}; "
+                f"missing H values={missing_h}"
+            )
+
+        print(f"-> Completeness check passed for {method.upper()}: {len(method_records)} rows ({len(unique_h)} H x {len(expiries)} expiries).\n")
+
     if param_records:
         df_params = pd.DataFrame(param_records)
         params_path = "results/stage1_parameters.csv"
@@ -116,7 +142,6 @@ def generate_stage1_results(methods=['polynomial', 'AMMO_ODE', 'PURE_MC']):
         print("Done! You are ready to generate tables.")
 
 
-# 2. LATEX TABLE
 # 2. LATEX TABLE
 def print_full_latex_longtable(csv_path="results/stage1_parameters.csv"):
     if not os.path.exists(csv_path):
@@ -238,7 +263,7 @@ def print_full_latex_longtable(csv_path="results/stage1_parameters.csv"):
     latex.append(r"\end{center}")
     
     print("\n".join(latex))
-    
+
 
 # 3. PARAMETERS CHARTS
 def plot_parameter_grid(csv_path="results/stage1_parameters.csv", save_path="results/stage1_parameters_grid.png"):
@@ -635,10 +660,10 @@ def print_stage2_latex_performance(perf_csv="results/stage2_performance.csv"):
 # ========================================================================
 if __name__ == '__main__':
     # STAGE 1
-    # generate_stage1_results()
+    generate_stage1_results()
     print_full_latex_longtable()
-    # plot_parameter_grid()
-    # plot_true_3d_surfaces(method='PURE_MC')
+    plot_parameter_grid()
+    plot_true_3d_surfaces(method='PURE_MC')
 
     # STAGE 2
     # Test Subtask 1 on the H you already have
