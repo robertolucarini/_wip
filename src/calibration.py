@@ -175,6 +175,8 @@ class RoughSABRCalibrator:
 
     def calibrate(self, method='PURE_MC', H_grid=np.array([0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50])):
         import time
+        from scipy.interpolate import PchipInterpolator
+        from scipy.optimize import least_squares
         
         print("\n" + "="*60)
         print(f"{f'ROUGH SABR 1D CALIBRATION | MODE: {method.upper()}':^60}")
@@ -196,7 +198,7 @@ class RoughSABRCalibrator:
             log_progress("Stage 1", f"Grid {i+1:2d}/{len(H_grid)} | Testing Hurst (H) = {H:.3f}", level=0)
             
             # ==========================================================
-            # 1. THE "DIRTY" LOCAL SEEDING FIT
+            # 1. THE "DIRTY" LOCAL SEEDING FIT (Using ODE just to find the valley)
             # ==========================================================
             log_progress("Pre-Opt", "Running independent slice fits for smart seeding...", level=1)
             local_nus = np.zeros(self.n_exp)
@@ -220,15 +222,15 @@ class RoughSABRCalibrator:
             
             smart_nu_guess = np.clip(np.mean(local_nus), 0.05, 5.0)
             log_progress("Pre-Opt", f"Smart Global Nu Seed calculated: {smart_nu_guess:.4f}", level=1)
-            
-            guess_global = np.concatenate(([smart_nu_guess], local_rhos))
-            lower_bounds = np.concatenate(([0.001], np.full(self.n_exp, -0.999)))
-            upper_bounds = np.concatenate(([10.0], np.full(self.n_exp, 0.999)))
 
             # ==========================================================
             # 2a. THE "AMMO ODE" METHOD (Fast but mathematically flawed for Stage 1)
             # ==========================================================
             if method == 'AMMO_ODE':
+                guess_global = np.concatenate(([smart_nu_guess], local_rhos))
+                lower_bounds = np.concatenate(([0.001], np.full(self.n_exp, -0.999)))
+                upper_bounds = np.concatenate(([10.0], np.full(self.n_exp, 0.999)))
+                
                 log_progress("AMMO-Opt", "Running fast ODE surrogate optimization...", level=1)
                 def global_obj(p):
                     nu = p[0]
@@ -254,45 +256,50 @@ class RoughSABRCalibrator:
                 rmse = np.sqrt(np.mean(((v_final - self.market_vols)*10000.0)**2))
 
             # ==========================================================
-            # 2b. THE "PURE MC" METHOD (Slow but structurally correct)
+            # 2b. THE "TRUE PURE MC" METHOD (No ODE interference)
             # ==========================================================
             elif method in ['PURE_MC', 'MC']:
-                log_progress("MC-Opt", "Starting Pure Monte Carlo Global Optimization (This will take time)...", level=1)
+                log_progress("MC-Opt", "Starting True Pure Monte Carlo Global Optimization...", level=1)
                 
-                # Counter trick to prevent logging every single Jacobian bump
+                # Guess is now: [Nu, Alpha_1...Alpha_N, Rho_1...Rho_N]
+                guess_global = np.concatenate(([smart_nu_guess], base_market_alphas, local_rhos))
+                
+                # Bounds for Nu, Alphas (must be >0), and Rhos
+                lower_bounds = np.concatenate(([0.001], np.full(self.n_exp, 0.0001), np.full(self.n_exp, -0.999)))
+                upper_bounds = np.concatenate(([10.0], np.full(self.n_exp, 1.0), np.full(self.n_exp, 0.999)))
+                
                 eval_counter = [0]
                 
                 def mc_global_obj(p):
                     eval_counter[0] += 1
                     
-                    # Log EVERY evaluation and force Python to flush it to the screen instantly
-                    print(f"   [MC-Opt] Eval: {eval_counter[0]:>3} | Current Nu: {p[0]:.4f} | Mean Rho: {np.mean(p[1:]):.4f}", flush=True)
-                        
                     nu = p[0]
-                    rhos = p[1:]
+                    alphas = p[1:self.n_exp+1]
+                    rhos = p[self.n_exp+1:]
+                    
+                    if eval_counter[0] % 10 == 0:
+                        print(f"   [MC-Opt] Eval: {eval_counter[0]:>3} | Nu: {nu:.4f} | Mean Alpha: {np.mean(alphas)*10000:.0f}bps | Mean Rho: {np.mean(rhos):.4f}", flush=True)
                     
                     r_ts = PchipInterpolator(self.expiries, rhos, extrapolate=True)
                     r_flat = r_ts(self.T_flat)
                     
-                    alphas = self.exact_atm_alpha(self.expiries, base_market_alphas, rhos, nu, H)
                     a_ts = PchipInterpolator(self.expiries, alphas, extrapolate=True)
                     a_flat = a_ts(self.T_flat)
                     
+                    # PURE MC EVALUATION (No exact_atm_alpha scaling!)
                     v_mc = self.rough_sabr_vol_mc(self.K_flat, self.T_flat, a_flat, r_flat, nu, H)
                     return (v_mc - self.market_vols) * 10000.0
                 
-                
                 log_progress("MC-Opt", "Handing over to scipy.least_squares (verbose=2 for iteration logs)...", level=1)
                 
-                # verbose=2 tells scipy to print a table row for every successful gradient step
                 res_mc = least_squares(mc_global_obj, guess_global, bounds=(lower_bounds, upper_bounds), 
                                        method='trf', diff_step=1e-3, ftol=1e-4, xtol=1e-4, verbose=2)
                 
                 log_progress("MC-Opt", f"Optimization converged after {res_mc.nfev} MC evaluations.", level=1)
                 
                 current_nu = res_mc.x[0]
-                current_rhos = res_mc.x[1:]
-                current_alphas = self.exact_atm_alpha(self.expiries, base_market_alphas, current_rhos, current_nu, H)
+                current_alphas = res_mc.x[1:self.n_exp+1]
+                current_rhos = res_mc.x[self.n_exp+1:]
                 
                 a_ts = PchipInterpolator(self.expiries, current_alphas, extrapolate=True)
                 r_ts = PchipInterpolator(self.expiries, current_rhos, extrapolate=True)
@@ -329,7 +336,7 @@ class RoughSABRCalibrator:
             'rho_func': PchipInterpolator(self.expiries, best_rhos, extrapolate=True),
             'nu_func': nu_func
         }
-           
+        
 
     def rough_sabr_vol_mc(self, k, T, alpha, rho, nu, H):
         device = 'cuda' if torch.cuda.is_available() else 'cpu'

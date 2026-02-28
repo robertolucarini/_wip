@@ -16,5 +16,5 @@ if CORR_MODE == "full":
 
 CHECK_MC = True
 CHECK_DRIFT = False
-CHECK_LIMIT = True
+CHECK_LIMIT = False
 
