@@ -4,15 +4,13 @@ from typing import Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import torch
+
 from config import CALI_MODE, H_GRID, CORR_MODE, BETA_SABR, SHIFT_SABR
 from src.calibration import RoughSABRCalibrator, CorrelationCalibrator
 from src.pricers import mapped_smm_ode, mapped_smm_pricer
 from src.torch_model import TorchRoughSABR_FMM
 from src.utils import load_swaption_vol_surface, parse_tenor, load_discount_curve, bootstrap_forward_rates  
-from config import CALI_MODE, H_GRID
-from src.calibration import RoughSABRCalibrator
-from src.utils import load_swaption_vol_surface, parse_tenor
-import torch
 
 
 def _available_underlyings(csv_path: str):
@@ -72,6 +70,25 @@ def _calibrate_for_underlying(vol_csv: str, underlying_tenor: float, underlying_
     return tenor, available, market_vol_matrix, calibrator, calib
 
 
+def _annotate_heatmap(ax, data, extent, fmt="{:.1f}"):
+    """Helper function to overlay numbers on the heatmap cells."""
+    rows, cols = data.shape
+    x0, x1, y0, y1 = extent
+    dx = (x1 - x0) / cols
+    # In imshow, row 0 is at the top (y1), and row N is at the bottom (y0)
+    dy = (y0 - y1) / rows 
+    
+    for i in range(rows):
+        for j in range(cols):
+            val = data[i, j]
+            if not np.isnan(val):
+                x = x0 + (j + 0.5) * dx
+                y = y1 + (i + 0.5) * dy
+                # Add a white bounding box so the text pops regardless of cell color
+                ax.text(x, y, fmt.format(val), ha='center', va='center', fontsize=8, color='black',
+                        bbox=dict(boxstyle='square,pad=0.1', fc='white', alpha=0.7, ec='none'))
+
+
 def make_market_vs_model_surface_plot(
     vol_csv: str,
     underlying_tenor: float = 1.0,
@@ -89,8 +106,6 @@ def make_market_vs_model_surface_plot(
     market_vols_bps = market_vol_matrix.values * 10000.0
     
     # Stage-aware model surface:
-    # - If CORR_MODE=full, run stage-2 correlation calibration and use mapped SMM pricing.
-    # - Otherwise, fallback to stage-1 marginal surface.
     if CORR_MODE.lower() == 'full':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         model_final = _build_stage2_model(vol_csv, calib, device=device)
@@ -111,8 +126,6 @@ def make_market_vs_model_surface_plot(
         model_vols_bps = _model_surface(calibrator, calib, method=surface_method) * 10000.0
         stage_label = 'Stage-1 (Marginal)'
 
-    
-    
     residuals_bps = model_vols_bps - market_vols_bps
 
     residual_rmse_bps = float(np.sqrt(np.nanmean(residuals_bps**2)))
@@ -133,12 +146,14 @@ def make_market_vs_model_surface_plot(
     axes[0].set_xlabel('Strike Offset (bps)')
     axes[0].set_ylabel('Expiry (Years)')
     fig.colorbar(im0, ax=axes[0], label='Normal Vol (bps)')
+    _annotate_heatmap(axes[0], market_vols_bps, extent, fmt="{:.1f}")
 
     im1 = axes[1].imshow(model_vols_bps, aspect='auto', cmap='viridis', extent=extent, vmin=vmin, vmax=vmax)
     axes[1].set_title(f"Model Vol Surface ({surface_method.upper()} | {stage_label})")
     axes[1].set_xlabel('Strike Offset (bps)')
     axes[1].set_ylabel('Expiry (Years)')
     fig.colorbar(im1, ax=axes[1], label='Normal Vol (bps)')
+    _annotate_heatmap(axes[1], model_vols_bps, extent, fmt="{:.1f}")
 
     rlim = max(abs(np.nanmin(residuals_bps)), abs(np.nanmax(residuals_bps)))
     im2 = axes[2].imshow(residuals_bps, aspect='auto', cmap='RdBu_r', extent=extent, vmin=-rlim, vmax=rlim)
@@ -146,6 +161,7 @@ def make_market_vs_model_surface_plot(
     axes[2].set_xlabel('Strike Offset (bps)')
     axes[2].set_ylabel('Expiry (Years)')
     fig.colorbar(im2, ax=axes[2], label='Residual (bps)')
+    _annotate_heatmap(axes[2], residuals_bps, extent, fmt="{:.1f}")
 
     fig.suptitle(
             f"Market vs Model Vol Surface | Underlying={tenor:.1f}Y | Calib={calibration_method.upper()} | {stage_label} | H={calib['H']:.3f} | ATM RMSE={atm_rmse_bps:.2f} bps",
@@ -334,7 +350,8 @@ def main():
     parser.add_argument('--vol-csv', default='data/estr_vol_full_strikes.csv')
     parser.add_argument('--underlying-tenor', type=float, default=1.0)
     parser.add_argument('--underlying-index', type=int, default=None)
-    parser.add_argument('--calibration-method', choices=['polynomial', 'ODE', 'MC'], default=CALI_MODE)
+    # Added PURE_MC and AMMO_ODE to argparse choices
+    parser.add_argument('--calibration-method', choices=['polynomial', 'ODE', 'MC', 'PURE_MC', 'AMMO_ODE'], default=CALI_MODE)
     parser.add_argument('--surface-method', choices=['polynomial', 'ode', 'mc'], default='mc')
     parser.add_argument('--output-surface', default='pics/market_vs_model_surface.png')
     parser.add_argument('--output-params', default='pics/optimal_parameter_term_structure.png')
