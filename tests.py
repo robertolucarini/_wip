@@ -3,7 +3,6 @@ import time
 import numpy as np
 from src.torch_model import TorchRoughSABR_FMM
 from src.utils import bootstrap_forward_rates, load_discount_curve
-import gc
 
 
 def run_aad_vs_fd_test():
@@ -103,6 +102,7 @@ def run_aad_vs_fd_test():
     print("-> In stress scenarios (Macro-bump), AAD strictly underestimates Bermudan risk.")
     print("=" * 80)
     # AGGRESSIVE MEMORY CLEANUP
+    import gc
     del model, price_base, F0_bumped, model_bumped, price_up
     gc.collect()
     torch.cuda.empty_cache()
@@ -337,8 +337,10 @@ def run_extreme_regime_test():
     else:
         print("Status: WARNING (Model failed under extreme stress)")
     print("=" * 65)
-    # Add cleanup at the very end of the function!
-    del model, F_paths
+    # AGGRESSIVE MEMORY CLEANUP
+    import gc
+    del model
+    if 'F_paths' in locals(): del F_paths
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -392,10 +394,10 @@ def run_put_call_parity_test():
     print(f"[Setup] 5Yx5Y European Swaption Test Strike: {test_strike*10000:.2f} bps (+{strike_offset_bps:.0f} bps)")
 
     
-    # 3. Simulate Paths to Expiry
-    n_paths = 65536
+    n_paths = 16384  # REDUCED FROM 65536 FOR GPU MEMORY SAFETY
     n_steps_per_year = 24
     time_grid = torch.linspace(0.0, T_ex, int(T_ex * n_steps_per_year) + 1, device=device, dtype=torch.float64)
+
     
     print(f"[Simulation] Generating {n_paths} paths to T={T_ex}Y...")
     with torch.no_grad():
@@ -443,13 +445,14 @@ def run_put_call_parity_test():
     parity_error = abs((payer_price - receiver_price) - analytical_forward_swap_pv)
     print(f"True Put-Call Parity Leakage: {parity_error:.6f} bps")
     
-    # Tolerance is slightly higher because MC has inherent variance
-    if parity_error < 0.5: 
+    if parity_error < 0.5:
         print("\nStatus: PASS (Discounting and Parity are mathematically exact)")
     else:
-        print("\nStatus: WARNING (Parity mismatch implies numeraire leakage or drift error)")
+        print("\nStatus: WARNING (Parity mismatch implies numeraire leakage)")
     print("=" * 65)
-    # Add cleanup at the very end of the function!
+
+    # AGGRESSIVE MEMORY CLEANUP
+    import gc
     del model, F_paths
     gc.collect()
     torch.cuda.empty_cache()
@@ -494,10 +497,6 @@ def run_reproducibility_test():
     else:
         print("Status: WARNING (Unexpected RNG behavior)")
     print("=" * 65)
-    # Add cleanup at the very end of the function!
-    del model, F_paths
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def run_time_step_stability_test():
@@ -545,10 +544,6 @@ def run_time_step_stability_test():
     else:
         print("Status: WARNING (No clear refinement convergence)")
     print("=" * 65)
-    # Add cleanup at the very end of the function!
-    del model, F_paths
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def run_correlation_consistency_test():
@@ -584,10 +579,6 @@ def run_correlation_consistency_test():
     else:
         print("Status: WARNING (Correlation matrix quality degraded)")
     print("=" * 65)
-    # Add cleanup at the very end of the function!
-    del model, F_paths
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def run_nu_term_structure_sensitivity_test():
@@ -636,10 +627,7 @@ def run_nu_term_structure_sensitivity_test():
     else:
         print("Status: WARNING (Very low sensitivity to nu term-structure changes)")
     print("=" * 65)
-    # Add cleanup at the very end of the function!
-    del model, F_paths
-    gc.collect()
-    torch.cuda.empty_cache()
+
 
 
 if __name__ == '__main__':
