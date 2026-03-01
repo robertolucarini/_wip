@@ -45,46 +45,17 @@ if __name__ == "__main__":
     t_init = time.time()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # --- 1. DATA PREPARATION & SMOOTHING ---
+    # --- 1. DATA PREPARATION (RAW, UNSMOOTHED) ---
     ois_func = load_discount_curve("data/estr_disc.csv")
     grid_T, F0_rates = bootstrap_forward_rates(ois_func)
     
-    # Load raw matrices
+    # Load raw matrices directly - no preprocessing, no arbitrage introduced
     vol_matrix_1y = load_swaption_vol_surface("data/estr_vol_full_strikes.csv", 1.0)
-    atm_matrix_raw = load_atm_matrix("data/estr_vol_full_strikes.csv")
-
-    # THE FIX: Brigo-Mercurio Smoothing and Stage 1 Anchor Alignment
-    if SMOOTHED:
-        print("\nApplying Brigo-Mercurio ABCD smoothing to ATM Matrix...")
-        atm_matrix = brigo_mercurio_abcd_smooth(atm_matrix_raw)
-        
-        print("Aligning Stage 1 smiles to smoothed ATM levels to prevent arbitrage...")
-        
-        # Bulletproof check: Find exactly how the ATM strike is labeled in your matrix
-        if 0.0 in vol_matrix_1y.columns:
-            atm_strike_label = 0.0
-        elif 'ATM' in vol_matrix_1y.columns:
-            atm_strike_label = 'ATM'
-        elif 0 in vol_matrix_1y.columns:
-            atm_strike_label = 0
-        else:
-            raise KeyError(f"Could not find ATM column in Stage 1 smile. Available columns: {vol_matrix_1y.columns}")
-            
-        for exp in vol_matrix_1y.index:
-            # Ensure the expiry exists in the ATM matrix and we have the 1Y Tenor column
-            if exp in atm_matrix.index and 1.0 in atm_matrix.columns:
-                old_atm = vol_matrix_1y.loc[exp, atm_strike_label] # Dynamically grab ATM
-                new_atm = atm_matrix.loc[exp, 1.0]                 # Grab smoothed 1Y-Tenor ATM
-                
-                shift = new_atm - old_atm                          # Calculate noise delta
-                vol_matrix_1y.loc[exp] += shift                    # Parallel shift the whole smile
-    else:
-        atm_matrix = atm_matrix_raw
-
+    atm_matrix = load_atm_matrix("data/estr_vol_full_strikes.csv")
 
 
     # --- 2. STAGE 1: 1D MARGINAL CALIBRATION ---
-    # Run the fast ODE grid search to find the global Hurst (H) and Nu using the SHIFTED smile
+    # Run the fast ODE grid search to find the global Hurst (H) and Nu using the pure smiles
     calibrator = RoughSABRCalibrator(vol_matrix_1y)
     calib = calibrator.calibrate(method=CALI_MODE, H_grid=H_GRID)
 
@@ -93,7 +64,6 @@ if __name__ == "__main__":
         "RMSE (bps)": calib['rmse_bps'],
         "Status": "SUCCESS"
     })
-
 
     if CORR_MODE == 'full':
         # --- 3. STAGE 2: SPATIAL CORRELATION CALIBRATION ---
@@ -281,7 +251,7 @@ if __name__ == "__main__":
     # 4. Evaluate MC Engine
     # Note: We use 65536 paths here for a highly precise diagnostic check
     import torch
-    device = 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     mc_prices_t = calibrator.rough_sabr_vol_mc.__globals__['mc_rough_bergomi_pricer'](
         torch.tensor(test_K, device=device, dtype=torch.float64), 
         torch.tensor(test_T_arr, device=device, dtype=torch.float64), 

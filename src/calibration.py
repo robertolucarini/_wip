@@ -468,7 +468,31 @@ class CorrelationCalibrator:
                     o_t = torch.tensor(self.omega, device=self.device, dtype=self.model.dtype)
                     S_mat = build_rapisarda_correlation_matrix(o_t)
                     v_surr = mapped_smm_ode(self.model, S_mat, exp_targets, ten_targets, strikes)
-                    return (v_surr.detach().cpu().numpy() + delta_k - vol_targets) * 10000.0
+                    
+                    # 1. Standard Pricing Residuals
+                    residuals = (v_surr.detach().cpu().numpy() + delta_k - vol_targets) * 10000.0
+                    
+                    # 2. Lesniewski Tikhonov Regularization
+                    import config
+                    if getattr(config, 'USE_TIKHONOV', False):
+                        lam = getattr(config, 'LAMBDA_CURVATURE', 10.0)
+                        
+                        # Apply discrete differential geometry based on available degrees of freedom
+                        if len(p_inner) >= 3:
+                            # 2nd-Order: Mean Curvature (Flatten the spikes)
+                            pen = p_inner[2:] - 2.0 * p_inner[1:-1] + p_inner[:-2]
+                        elif len(p_inner) == 2:
+                            # 1st-Order: Slope (Prevent sharp jumps)
+                            pen = p_inner[1:] - p_inner[:-1]
+                        else:
+                            # 0th-Order: Anchor (Keep single angles stable)
+                            pen = p_inner - (np.pi / 4.0)
+                            
+                        # Scale to match least_squares MSE definition: sum(f^2)/2
+                        pen_res = np.sqrt(2.0 * lam) * pen
+                        residuals = np.concatenate([residuals, pen_res])
+                        
+                    return residuals
                     
                 def ammo_jacobian(p_inner):
                     def _diff_obj(p_tensor):
@@ -478,12 +502,30 @@ class CorrelationCalibrator:
                         S_mat = build_rapisarda_correlation_matrix(o_mod)
                         v_surr = mapped_smm_ode(self.model, S_mat, exp_targets, ten_targets, strikes)
                         
-                        return (v_surr + torch.tensor(delta_k, device=self.device) - torch.tensor(vol_targets, device=self.device)) * 10000.0
+                        # 1. Differentiable Pricing Residuals
+                        res = (v_surr + torch.tensor(delta_k, device=self.device) - torch.tensor(vol_targets, device=self.device)) * 10000.0
                         
+                        # 2. Differentiable Curvature Penalty
+                        import config
+                        if getattr(config, 'USE_TIKHONOV', False):
+                            lam = getattr(config, 'LAMBDA_CURVATURE', 10.0)
+                            if len(p_tensor) >= 3:
+                                pen = p_tensor[2:] - 2.0 * p_tensor[1:-1] + p_tensor[:-2]
+                            elif len(p_tensor) == 2:
+                                pen = p_tensor[1:] - p_tensor[:-1]
+                            else:
+                                pen = p_tensor - (np.pi / 4.0)
+                                
+                            pen_res = math.sqrt(2.0 * lam) * pen
+                            res = torch.cat([res, pen_res])
+                            
+                        return res
+                        
+                    # Exact Autograd Jacobian
                     p_t = torch.tensor(p_inner, device=self.device, dtype=self.model.dtype, requires_grad=True)
                     jac = torch.autograd.functional.jacobian(_diff_obj, p_t)
                     
-                    # CATCH NANS BEFORE THEY HIT SCIPY TO PREVENT CRASH
+                    # Prevent Scipy crashes from numerical boundaries
                     jac_np = jac.detach().cpu().numpy()
                     if not np.isfinite(jac_np).all():
                         jac_np = np.nan_to_num(jac_np, nan=0.0, posinf=0.0, neginf=0.0)

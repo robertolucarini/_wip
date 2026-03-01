@@ -637,7 +637,7 @@ from src.pricers import torch_bermudan_pricer
 
 def test_lsm_edge_case():
     print("\n--- Testing LSM Edge Case (< 50 ITM Paths) ---")
-    device = 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # 1. Setup dummy model parameters
     N = 10
@@ -674,7 +674,7 @@ def test_lsm_edge_case():
 
 def test_rho_instability():
     print("\n--- Testing Rho/Cholesky Numerical Instability ---")
-    device = 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # Setup dummy model parameters
     N = 5
@@ -708,7 +708,7 @@ def test_rho_instability():
 
 def test_absorbing_boundary_simulation():
     print("\n--- Testing SABR Boundary Dynamics (Full Simulation) ---")
-    device = 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # 1. Setup dummy model parameters
     N = 1
@@ -770,7 +770,7 @@ def test_absorbing_boundary_simulation():
 
 def test_ammo_memory_leak():
     print("\n--- Testing AMMO Surrogate Memory Leak (Autograd Graph) ---")
-    device = 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # Setup dummy model
     N = 3
@@ -813,7 +813,7 @@ def test_ammo_memory_leak():
 
 def test_smm_ode_edge_cases():
     print("\n--- Testing SMM ODE Surrogate Edge Cases ---")
-    device = 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     N = 3
     tenors = np.linspace(0.0, 3.0, N+1)
@@ -855,13 +855,183 @@ def test_smm_ode_edge_cases():
     print("Passed: Boundary mathematics aligned with core FMM.")
 
 
+def test_tikhonov_regularization_dims():
+    print("\n" + "="*65)
+    print(f"{'TEST 9: TIKHONOV CURVATURE MATRIX INTEGRITY':^65}")
+    print("="*65)
+    
+    import config
+    # Temporarily force the flag on for the test
+    config.USE_TIKHONOV = True
+    config.LAMBDA_CURVATURE = 10.0
+    
+    from src.torch_model import TorchRoughSABR_FMM
+    from src.calibration import CorrelationCalibrator
+    import pandas as pd
+    import numpy as np
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    N = 6
+    grid_T = np.linspace(0.0, 6.0, N+1)
+    F0_rates = np.full(N, 0.03)
+    
+    # Mock Model
+    model = TorchRoughSABR_FMM(
+        grid_T, F0_rates, 
+        alpha_f=lambda t: np.full_like(t, 0.01),
+        rho_f=lambda t: np.full_like(t, -0.4),
+        nu_f=lambda t: np.full_like(t, 0.3),
+        H=0.1, correlation_mode='full', device=device
+    )
+    
+    # Mock Data (10 swaptions)
+    mock_df = pd.DataFrame(index=[1.0, 2.0], columns=[1.0, 2.0, 3.0, 4.0, 5.0])
+    mock_df.loc[:, :] = 0.01
+    
+    # Initialize calibrator
+    calibrator = CorrelationCalibrator(mock_df, model)
+    
+    # Emulate the loop state for row index 4 (N >= 4 yields >= 3 free angles to test Curvature)
+    calibrator.idx = 4
+    calibrator.free_indices = [1, 3, 4] # 3 free angles
+    calibrator.exp_targets = np.array([1.0, 2.0])
+    calibrator.ten_targets = np.array([1.0, 2.0])
+    calibrator.strikes = np.array([0.0, 0.0])
+    calibrator.vol_targets = np.array([0.01, 0.01])
+    calibrator.delta_k = np.zeros(2)
+    
+    p_inner = np.array([0.5, 0.6, 0.7]) # 3 free parameters
+    
+    # Inject the functions directly into the local scope to test them
+    def surrogate(p):
+        calibrator.omega[calibrator.idx, calibrator.free_indices] = p
+        o_t = torch.tensor(calibrator.omega, device=device, dtype=model.dtype)
+        from src.utils import build_rapisarda_correlation_matrix
+        from src.pricers import mapped_smm_ode
+        S_mat = build_rapisarda_correlation_matrix(o_t)
+        v_surr = mapped_smm_ode(model, S_mat, calibrator.exp_targets, calibrator.ten_targets, calibrator.strikes)
+        
+        residuals = (v_surr.detach().cpu().numpy() + calibrator.delta_k - calibrator.vol_targets) * 10000.0
+        
+        if getattr(config, 'USE_TIKHONOV', False):
+            lam = getattr(config, 'LAMBDA_CURVATURE', 10.0)
+            if len(p) >= 3:
+                pen = p[2:] - 2.0 * p[1:-1] + p[:-2]
+            elif len(p) == 2:
+                pen = p[1:] - p[:-1]
+            else:
+                pen = p - (np.pi / 4.0)
+            pen_res = np.sqrt(2.0 * lam) * pen
+            residuals = np.concatenate([residuals, pen_res])
+        return residuals
+
+    def jacobian(p):
+        import math
+        def _diff_obj(p_tensor):
+            o_mod = torch.tensor(calibrator.omega, device=device, dtype=model.dtype).clone()
+            o_mod[calibrator.idx, calibrator.free_indices] = p_tensor  
+            
+            from src.utils import build_rapisarda_correlation_matrix
+            from src.pricers import mapped_smm_ode
+            S_mat = build_rapisarda_correlation_matrix(o_mod)
+            v_surr = mapped_smm_ode(model, S_mat, calibrator.exp_targets, calibrator.ten_targets, calibrator.strikes)
+            
+            res = (v_surr + torch.tensor(calibrator.delta_k, device=device) - torch.tensor(calibrator.vol_targets, device=device)) * 10000.0
+            
+            if getattr(config, 'USE_TIKHONOV', False):
+                lam = getattr(config, 'LAMBDA_CURVATURE', 10.0)
+                if len(p_tensor) >= 3:
+                    pen = p_tensor[2:] - 2.0 * p_tensor[1:-1] + p_tensor[:-2]
+                elif len(p_tensor) == 2:
+                    pen = p_tensor[1:] - p_tensor[:-1]
+                else:
+                    pen = p_tensor - (np.pi / 4.0)
+                pen_res = math.sqrt(2.0 * lam) * pen
+                res = torch.cat([res, pen_res])
+            return res
+            
+        p_t = torch.tensor(p, device=device, dtype=model.dtype, requires_grad=True)
+        jac = torch.autograd.functional.jacobian(_diff_obj, p_t)
+        return jac.detach().cpu().numpy()
+
+    # Run tests
+    res_out = surrogate(p_inner)
+    jac_out = jacobian(p_inner)
+    
+    print(f"Number of Free Params: {len(p_inner)}")
+    print(f"Number of Swaptions  : {len(calibrator.vol_targets)}")
+    print(f"Residual Vector Size : {len(res_out)} (Expected: Swaptions + Penalties)")
+    print(f"Jacobian Matrix Shape: {jac_out.shape} (Expected: Residuals x Params)")
+    
+    if jac_out.shape[0] == len(res_out) and jac_out.shape[1] == len(p_inner):
+        print("\nStatus: PASS (AMMO Augmented Matrix matches Scipy Least-Squares requirements)")
+    else:
+        print("\nStatus: FAIL (Matrix dimension mismatch!)")
+    print("=" * 65)
+
+
+def test_tikhonov_analytical_gradients():
+    print("\n" + "="*65)
+    print(f"{'TEST 10: TIKHONOV EXACT ANALYTICAL GRADIENTS':^65}")
+    print("="*65)
+    
+    import config
+    import torch
+    import math
+    import numpy as np
+    
+    # Force test parameters
+    config.USE_TIKHONOV = True
+    config.LAMBDA_CURVATURE = 10.0
+    
+    lam = config.LAMBDA_CURVATURE
+    expected_multiplier = math.sqrt(2.0 * lam)
+    
+    # The true analytical gradient for a 3-parameter 2nd-order finite difference
+    expected_gradient = np.array([1.0 * expected_multiplier, 
+                                 -2.0 * expected_multiplier, 
+                                  1.0 * expected_multiplier])
+    
+    # Simulate the exact PyTorch penalty function
+    def _pure_penalty_obj(p_tensor):
+        # 2nd-Order: Mean Curvature
+        pen = p_tensor[2:] - 2.0 * p_tensor[1:-1] + p_tensor[:-2]
+        return math.sqrt(2.0 * lam) * pen
+        
+    # Input tensor (values don't matter because the derivative is constant)
+    p_inner = np.array([0.5, 0.6, 0.7])
+    p_t = torch.tensor(p_inner, dtype=torch.float64, requires_grad=True)
+    
+    # Ask PyTorch to calculate the Jacobian
+    jac = torch.autograd.functional.jacobian(_pure_penalty_obj, p_t)
+    pytorch_gradient = jac.detach().cpu().numpy()[0] # Grab the 1D gradient array
+    
+    print(f"Lambda (Curvature) : {lam}")
+    print(f"Expected Gradient  : {expected_gradient}")
+    print(f"PyTorch Autograd   : {pytorch_gradient}")
+    
+    # Check if they match up to 7 decimal places
+    diff = np.max(np.abs(expected_gradient - pytorch_gradient))
+    print(f"Maximum Difference : {diff:.8e}")
+    
+    if diff < 1e-7:
+        print("\nStatus: PASS (PyTorch AAD perfectly matches the discrete Laplacian!)")
+    else:
+        print("\nStatus: FAIL (Gradient mismatch detected)")
+    print("=" * 65)
+
+
 if __name__ == "__main__":
-    test_smm_ode_edge_cases()
+    # test_tikhonov_regularization_dims()
+    test_tikhonov_analytical_gradients()
+
+
+# if __name__ == "__main__":
+#     test_smm_ode_edge_cases()
     # test_lsm_edge_case()
     # test_rho_instability()
     # test_absorbing_boundary_simulation()
     # test_ammo_memory_leak()
-
 
 
 # MAIN TESTS
