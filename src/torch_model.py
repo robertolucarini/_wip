@@ -146,7 +146,7 @@ class TorchRoughSABR_FMM(nn.Module):
                 
                 fbm_4 = torch.matmul(dz_all_in.transpose(1, 2), kern.T).transpose(1, 2)
                 fbm_curve = torch.matmul(fbm_4[..., :-1], self.loadings.T)
-                fbm = self.rhos.view(1, 1, -1) * fbm_curve + torch.sqrt(1.0 - self.rhos**2).view(1, 1, -1) * fbm_4[..., -1:]
+                fbm = self.rhos.view(1, 1, -1) * fbm_curve + torch.sqrt(torch.clamp(1.0 - self.rhos**2, min=0.0)).view(1, 1, -1) * fbm_4[..., -1:]
             else:
                 # Full Mode (Adachi N+1 Matrix)
                 wr_all = torch.matmul(dz_all_in, self.loadings.T)
@@ -170,7 +170,7 @@ class TorchRoughSABR_FMM(nn.Module):
             
             if freeze_drift:
                 # 1. Calculate the shifted SABR local vol component for the frozen initial curve
-                eta_f0 = torch.pow(torch.abs(f0 + self.shift), self.beta_sabr)
+                eta_f0 = torch.pow(torch.clamp(f0 + self.shift, min=0.0), self.beta_sabr)
                 vol_scale = alphas * eta_f0
                 
                 # 2. Apply it to the drift (omega)
@@ -187,7 +187,7 @@ class TorchRoughSABR_FMM(nn.Module):
                 res = [F_t.unsqueeze(1)]
                 for i in range(n_steps):
                     # 1. Dynamic local vol component evaluated at current F_t
-                    eta_F = torch.pow(torch.abs(F_t + self.shift), self.beta_sabr)
+                    eta_F = torch.pow(torch.clamp(F_t + self.shift, min=0.0), self.beta_sabr)
                     vol_scale = alphas * eta_F
                     
                     # 2. Dynamic drift adjustment

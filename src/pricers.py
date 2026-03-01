@@ -70,15 +70,25 @@ def torch_bermudan_pricer(model, trade_specs, n_paths, time_grid, use_checkpoint
                 # Glasserman AAD standard: Detach inputs for the regression weights
                 sol = torch.linalg.lstsq(X[itm].detach(), deflated_cf[itm].detach()).solution
                 
-                # Evaluate continuation value for ALL paths (to avoid in-place indexing)
+                # Evaluate continuation value for ALL paths
                 continuation = X @ sol
                 
                 # Global exercise mask: ITM AND payoff is strictly greater than continuation
                 do_ex = itm & (intrinsic_deflated > continuation)
                 
-                # AUTOGRAD FIX: Out-of-place global update.
-                # This safely routes the gradients through the correct exercise boundary without breaking the graph.
-                deflated_cf = torch.where(do_ex, intrinsic_deflated, deflated_cf)
+            elif itm.sum() > 0:
+                # FALLBACK: Too few paths for stable regression.
+                # We strictly compare intrinsic value against the realized deflated future cash flow.
+                # (Perfect foresight fallback, standard when regression fails).
+                do_ex = itm & (intrinsic_deflated > deflated_cf)
+                
+            else:
+                # No paths are ITM
+                do_ex = torch.zeros_like(itm, dtype=torch.bool)
+                
+            # AUTOGRAD FIX: Out-of-place global update.
+            # Safely routes gradients through the correct exercise boundary without breaking the graph.
+            deflated_cf = torch.where(do_ex, intrinsic_deflated, deflated_cf)
 
     log_progress("AAD", "Computing Greeks via backward pass...", 0)
     p0_Tn = model.get_terminal_bond()
@@ -107,7 +117,8 @@ def mapped_smm_pricer(model, Sigma_matrix, expiries, tenors, strike_offsets, dt=
     nu_smm = torch.zeros(n_options, device=device, dtype=dtype)
     
     # Calculate true Normal volatility of forward rates at t=0
-    eta_F0 = torch.pow(torch.abs(F0 + model.shift), model.beta_sabr)
+    # Use absorbing boundary to match the core FMM dynamics
+    eta_F0 = torch.pow(torch.clamp(F0 + model.shift, min=0.0), model.beta_sabr)
     alpha_normal = model.alphas * eta_F0 
     
     for i in range(n_options):
@@ -187,7 +198,8 @@ def mapped_smm_ode(model, Sigma_matrix, expiries, tenors, strike_offsets):
     F0 = model.F0
     P0 = torch.cumprod(torch.cat([torch.tensor([1.0], device=device, dtype=dtype), 1.0 / (1.0 + tau * F0)]), dim=0)
     
-    eta_F0 = torch.pow(torch.abs(F0 + model.shift), model.beta_sabr)
+    # 1. FIX: Absorbing Boundary
+    eta_F0 = torch.pow(torch.clamp(F0 + model.shift, min=0.0), model.beta_sabr)
     alpha_normal = model.alphas * eta_F0 
     
     alpha_smm_list, rho_smm_list, nu_smm_list = [], [], []
@@ -202,8 +214,11 @@ def mapped_smm_ode(model, Sigma_matrix, expiries, tenors, strike_offsets):
         if end_idx <= start_idx:
             alpha_smm_list.append(torch.tensor(1e-5, device=device, dtype=dtype))
             rho_smm_list.append(torch.tensor(0.0, device=device, dtype=dtype))
-            nu_smm_list.append(torch.tensor(model.nus[start_idx].item(), device=device, dtype=dtype))
+            # 2. FIX: Prevent out-of-bounds index on terminal tenors
+            safe_idx = min(start_idx, len(model.nus) - 1)
+            nu_smm_list.append(torch.tensor(model.nus[safe_idx].item(), device=device, dtype=dtype))
             continue
+
             
         P_I = P0[start_idx]
         P_J = P0[end_idx]
@@ -234,14 +249,13 @@ def mapped_smm_ode(model, Sigma_matrix, expiries, tenors, strike_offsets):
     nu_smm = torch.stack(nu_smm_list)
     
     k_t = torch.tensor(strike_offsets, device=device, dtype=dtype)
-    T_t = torch.tensor(expiries, device=device, dtype=dtype)
+    # 3. FIX: Soft clamp on Time to prevent T^(negative) infinity explosion
+    T_t = torch.clamp(torch.tensor(expiries, device=device, dtype=dtype), min=1e-4)
     H = model.H
     
-    # 1. EXACT NORMALIZATION
     c_H = 1.0 / (torch.sqrt(2.0 * H) * torch.exp(torch.lgamma(H + 0.5)))
     nu_eff = nu_smm * c_H
     
-    # 2. ROUGH TO CLASSICAL MAPPING 
     A = (rho_smm * nu_eff) / (H + 0.5) * (T_t**(H - 0.5))
     B = (2.0 - 3.0 * rho_smm**2) * (nu_eff**2) * (T_t**(2.0*H - 1.0))
     

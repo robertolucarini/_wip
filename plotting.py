@@ -1,7 +1,24 @@
+import matplotlib.pyplot as plt
+
+# Inject this configuration before creating any plots
+plt.rcParams.update({
+    "text.usetex": True,
+    "font.family": "serif",
+    "font.serif": ["Computer Modern Roman"],
+    "axes.labelsize": 10,
+    "font.size": 10,
+    "legend.fontsize": 8,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "axes.titlesize": 11,
+    # This size perfectly matches a standard LaTeX text width
+    "figure.figsize": (6.0, 6.0), 
+    "figure.autolayout": True
+})
+
 import argparse
 import os
 from typing import Optional
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -344,7 +361,50 @@ def _mapped_smm_term_structures(model, Sigma_matrix, expiries, tenor):
 
     return np.array(alpha_smm), np.array(rho_smm)
 
+from matplotlib.gridspec import GridSpec
 
+def plot_publication_vol_surface(market_vol, model_vol, residuals, X, Y):
+    fig = plt.figure()
+    
+    # Define a grid: 2 rows, 2 columns
+    gs = GridSpec(2, 2, figure=fig, height_ratios=[1, 1])
+    
+    # Top Left: Market Surface
+    ax_mkt = fig.add_subplot(gs[0, 0], projection='3d')
+    ax_mkt.plot_surface(X, Y, market_vol, cmap='viridis', edgecolor='none', alpha=0.8)
+    ax_mkt.set_title(r"Market Volatility ($\sigma_{\text{Mkt}}$)")
+    ax_mkt.set_xlabel(r"Expiry ($T$)")
+    ax_mkt.set_ylabel(r"Tenor ($\tau$)")
+    
+    # Top Right: Model Surface
+    ax_mod = fig.add_subplot(gs[0, 1], projection='3d')
+    ax_mod.plot_surface(X, Y, model_vol, cmap='plasma', edgecolor='none', alpha=0.8)
+    ax_mod.set_title(r"Model Volatility ($\sigma_{\text{Mod}}$)")
+    ax_mod.set_xlabel(r"Expiry ($T$)")
+    ax_mod.set_ylabel(r"Tenor ($\tau$)")
+    
+    # Bottom Row spanning both columns: Residual Bars
+    ax_res = fig.add_subplot(gs[1, :], projection='3d')
+    
+    # Flatten the arrays for the 3D bar chart
+    x_flat = X.flatten()
+    y_flat = Y.flatten()
+    z_flat = np.zeros_like(x_flat)
+    dz_flat = residuals.flatten() * 10000 # Convert to bps
+    
+    # Optimize width/depth based on your grid size to prevent overlapping
+    dx = np.full_like(x_flat, 0.2)
+    dy = np.full_like(y_flat, 0.2)
+    
+    ax_res.bar3d(x_flat, y_flat, z_flat, dx, dy, dz_flat, color='crimson', alpha=0.6)
+    ax_res.set_title(r"Absolute Pricing Error (bps)")
+    ax_res.set_xlabel(r"Expiry ($T$)")
+    ax_res.set_ylabel(r"Tenor ($\tau$)")
+    
+    # Export as a high-resolution PDF, not a PNG
+    plt.savefig("pics/publication_surface.pdf", bbox_inches='tight', dpi=300)
+    plt.close()
+    
 def main():
     parser = argparse.ArgumentParser(description='Plot market vs model volatility surface diagnostics.')
     parser.add_argument('--vol-csv', default='data/estr_vol_full_strikes.csv')

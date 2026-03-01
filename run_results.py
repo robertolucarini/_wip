@@ -1,9 +1,32 @@
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib import cm
+from matplotlib.gridspec import GridSpec # FIX: Added missing import
+import numpy as np
+import pandas as pd
+import os
+
+# Revised Configuration: Uses internal MathText instead of external LaTeX
+plt.rcParams.update({
+    "text.usetex": False,            # FIX: Disables external LaTeX requirement
+    "font.family": "serif",
+    "font.serif": ["STIXGeneral", "Computer Modern Roman"],
+    "mathtext.fontset": "cm",       # Forces Matplotlib to emulate LaTeX fonts
+    "axes.labelsize": 10,
+    "font.size": 10,
+    "legend.fontsize": 8,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "axes.titlesize": 11,
+    "figure.figsize": (7.0, 9.0),
+    "figure.constrained_layout.use": True # FIX: Avoids tight_layout 3D warnings
+})
+
 import os
 import time
 import numpy as np
 import pandas as pd
 import torch
-import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from src.utils import load_swaption_vol_surface
 from src.calibration import RoughSABRCalibrator
@@ -142,7 +165,7 @@ def generate_stage1_results(methods=['AMMO_ODE', 'PURE_MC']):
         print("Done! You are ready to generate tables.")
 
 
-# 2. LATEX TABLE
+# 2. LATEX TABLES
 def print_full_latex_longtable(csv_path="results/stage1_parameters.csv"):
     if not os.path.exists(csv_path):
         print(f"Error: {csv_path} not found.")
@@ -152,100 +175,245 @@ def print_full_latex_longtable(csv_path="results/stage1_parameters.csv"):
     df['H'] = df['H'].round(3)
     df['Expiry'] = df['Expiry'].round(3)
 
+    # 1. Drop H = 0.45 to save horizontal space
+    df = df[df['H'] != 0.45]
     all_Hs = sorted(df['H'].unique())
     all_expiries = sorted(df['Expiry'].unique())
 
-    def extract_row(subset_h, exp, method):
+    # Helper function to extract and format a specific model's data
+    def extract_formatted_row(subset_h, exp, method):
         row = subset_h[(subset_h['Expiry'] == exp) & (subset_h['Method'] == method)]
         if row.empty:
-            return '-', '-', np.inf, '-'
-        alpha = f"{row['Alpha'].values[0] * 10000.0:.1f}"
-        rho = f"{row['Rho'].values[0]:.3f}"
+            return '-', '-', '-'
+        
+        alpha_val = row['Alpha'].values[0] * 10000.0
+        rho_val = row['Rho'].values[0]
         rmse_val = row['RMSE_bps'].values[0]
-        rmse = f"{rmse_val:.2f}"
-        return alpha, rho, rmse_val, rmse
-
-    def build_panel_cells(subset_h, exp):
-        mc_alpha, mc_rho, mc_rmse_val, mc_rmse = extract_row(subset_h, exp, 'PURE_MC')
-        ode_alpha, ode_rho, ode_rmse_val, ode_rmse = extract_row(subset_h, exp, 'AMMO_ODE')
-
-        if np.isfinite(mc_rmse_val) and np.isfinite(ode_rmse_val):
-            if mc_rmse_val < ode_rmse_val:
-                mc_rmse = f"\\textbf{{{mc_rmse}}}"
-            elif ode_rmse_val < mc_rmse_val:
-                ode_rmse = f"\\textbf{{{ode_rmse}}}"
-
-        return [mc_alpha, ode_alpha, mc_rho, ode_rho, mc_rmse, ode_rmse]
+        
+        alpha_str = f"{alpha_val:.1f}"
+        
+        # 2. Format Rho to drop leading zero (e.g., -.148 instead of -0.148)
+        rho_str = f"{rho_val:.2f}".replace('0.', '.', 1).replace('-0.', '-.', 1)
+        if rho_str == '.000' or rho_str == '-.000':
+            rho_str = '.000'
+            
+        # 3. No bolding for RMSE
+        rmse_str = f"{rmse_val:.2f}"
+        
+        return alpha_str, rho_str, rmse_str
 
     br = r"\\"
-    n_h = len(all_Hs)
-    col_spec = 'c|' + '|'.join(['cccccc'] * n_h)
-
     latex = []
+    
     latex.append(r"\begin{landscape}")
-    latex.append(r"\begin{center}")
-    latex.append(r"\scriptsize")
-    latex.append(r"\setlength{\tabcolsep}{3pt}")
-    latex.append(r"\begin{longtable}{" + col_spec + "}")
-    latex.append(r"\caption{Stage 1 calibrated parameters (MC vs ODE) shown horizontally for all H values. The table is in landscape mode so the PDF page should be rotated for reading.}" + br)
-    latex.append(r"\toprule")
-
-    # Header row 1: H panels
-    h_header = [r"\textbf{Expiry}"]
+    latex.append(r"\begin{table}[p]")
+    latex.append(r"    \centering")
+    latex.append(r"    \scriptsize")
+    latex.append(r"    \setlength{\tabcolsep}{3pt}")
+    
+    # ---------------------------------------------------------
+    # TABLE 1: EXACT MONTE CARLO TARGET
+    # ---------------------------------------------------------
+    latex.append(r"    % ==========================================")
+    latex.append(r"    % TABLE 1: EXACT MONTE CARLO TARGET")
+    latex.append(r"    % ==========================================")
+    latex.append(r"    \caption{Stage 1 Calibrated Parameters: \textbf{Exact Monte Carlo Target} across Hurst Exponents.}")
+    latex.append(r"    \vspace{0.5em}")
+    
+    col_spec = "l | " + " | ".join(["ccc"] * len(all_Hs))
+    latex.append(r"    \begin{tabular}{" + col_spec + "}")
+    latex.append(r"    \toprule")
+    
+    # Header 1: Expiry and H values
+    h_header = [r"    \multirow{2}{*}{\textbf{Exp}}"]
+    for h in all_Hs:
+        h_header.append(rf"\multicolumn{{3}}{{c|}}{{\textbf{{H={h:.2f}}}}}")
+    # Remove the very last trailing pipe constraint on the multi-column if needed, but it's fine here.
+    latex.append("    & " + " & ".join(h_header[1:]) + f" {br}")
+    
+    # Header 2: Nu values for MC
+    nu_header = [""]
     for h in all_Hs:
         subset_h = df[df['H'] == h]
         mc_nu = subset_h[subset_h['Method'] == 'PURE_MC']['Nu']
-        ode_nu = subset_h[subset_h['Method'] == 'AMMO_ODE']['Nu']
-        if (not mc_nu.empty) and (not ode_nu.empty):
-            nu_txt = f"MC \\nu={mc_nu.iloc[0]:.4f}, ODE \\nu={ode_nu.iloc[0]:.4f}"
-        else:
-            nu_txt = "N/A"
-        h_header.append(rf"\multicolumn{{6}}{{c|}}{{\textbf{{$H={h:.2f}$}} ({nu_txt})}}")
-    latex.append(' & '.join(h_header) + ' ' + br)
-
-    # Header row 2: Alpha/Rho/RMSE per panel
-    metric_header = ['']
+        nu_val = mc_nu.iloc[0] if not mc_nu.empty else 0.0
+        nu_header.append(rf"\multicolumn{{3}}{{c|}}{{($\nu={nu_val:.2f}$)}}")
+    latex.append("    & " + " & ".join(nu_header[1:]) + f" {br}")
+    
+    # Header 3: Midrules
+    cmidrules = []
+    start_col = 2
     for _ in all_Hs:
-        metric_header.extend([
-            r"\multicolumn{2}{c}{\textbf{Alpha (bps)}}",
-            r"\multicolumn{2}{c}{\textbf{Rho}}",
-            r"\multicolumn{2}{c|}{\textbf{RMSE (bps)}}"
-        ])
-    latex.append(' & '.join(metric_header) + ' ' + br)
-
-    # Header row 3: MC/ODE labels
-    method_header = [''] + ['MC', 'ODE', 'MC', 'ODE', 'MC', 'ODE'] * n_h
-    latex.append(' & '.join(method_header) + ' ' + br)
-    latex.append(r"\midrule")
-    latex.append(r"\endfirsthead")
-
-    # Continuation header
-    latex.append(r"\toprule")
-    latex.append(' & '.join(h_header) + ' ' + br)
-    latex.append(' & '.join(metric_header) + ' ' + br)
-    latex.append(' & '.join(method_header) + ' ' + br)
-    latex.append(r"\midrule")
-    latex.append(r"\endhead")
-    latex.append(r"\midrule")
-    latex.append(rf"\multicolumn{{{1 + 6*n_h}}}{{r}}{{Continued on next page}} {br}")
-    latex.append(r"\endfoot")
-    latex.append(r"\bottomrule")
-    latex.append(r"\endlastfoot")
-
-    # Body rows: one row per expiry, all H panels side-by-side
+        cmidrules.append(rf"\cmidrule(lr){{{start_col}-{start_col+2}}}")
+        start_col += 3
+    latex.append("    " + " ".join(cmidrules))
+    
+    # Header 4: Metrics (Alpha, Rho, Err)
+    metric_header = [""] + [r"$\alpha$", r"$\rho$", r"\textbf{Err}"] * len(all_Hs)
+    latex.append("    " + " & ".join(metric_header) + f" {br}")
+    latex.append(r"    \midrule")
+    
+    # Body rows for MC
     for exp in all_expiries:
-        row = [f"{exp:.1f}Y"]
+        row = [f"{exp:.1f}"]
         for h in all_Hs:
             subset_h = df[df['H'] == h]
-            row.extend(build_panel_cells(subset_h, exp))
-        latex.append(' & '.join(row) + ' ' + br)
-
-    latex.append(r"\end{longtable}")
-    latex.append(r"\end{center}")
+            alpha, rho, rmse = extract_formatted_row(subset_h, exp, 'PURE_MC')
+            row.extend([alpha, rho, rmse])
+        latex.append("    " + " & ".join(row) + f" {br}")
+        
+    latex.append(r"    \bottomrule")
+    latex.append(r"    \end{tabular}")
+    
+    latex.append(r"    \vspace{2.5em} % Spacing between tables")
+    
+    # ---------------------------------------------------------
+    # TABLE 2: ANALYTICAL ODE SURROGATE
+    # ---------------------------------------------------------
+    latex.append(r"    % ==========================================")
+    latex.append(r"    % TABLE 2: ANALYTICAL ODE SURROGATE")
+    latex.append(r"    % ==========================================")
+    latex.append(r"    \caption{Stage 1 Calibrated Parameters: \textbf{Analytical ODE Surrogate} across Hurst Exponents.}")
+    latex.append(r"    \vspace{0.5em}")
+    
+    latex.append(r"    \begin{tabular}{" + col_spec + "}")
+    latex.append(r"    \toprule")
+    
+    # Header 1: Expiry and H values (Same as MC)
+    latex.append("    & " + " & ".join(h_header[1:]) + f" {br}")
+    
+    # Header 2: Nu values for ODE
+    nu_header_ode = [""]
+    for h in all_Hs:
+        subset_h = df[df['H'] == h]
+        ode_nu = subset_h[subset_h['Method'] == 'AMMO_ODE']['Nu']
+        nu_val = ode_nu.iloc[0] if not ode_nu.empty else 0.0
+        nu_header_ode.append(rf"\multicolumn{{3}}{{c|}}{{($\nu={nu_val:.2f}$)}}")
+    latex.append("    & " + " & ".join(nu_header_ode[1:]) + f" {br}")
+    
+    # Header 3: Midrules (Same as MC)
+    latex.append("    " + " ".join(cmidrules))
+    
+    # Header 4: Metrics (Same as MC)
+    latex.append("    " + " & ".join(metric_header) + f" {br}")
+    latex.append(r"    \midrule")
+    
+    # Body rows for ODE
+    for exp in all_expiries:
+        row = [f"{exp:.1f}"]
+        for h in all_Hs:
+            subset_h = df[df['H'] == h]
+            alpha, rho, rmse = extract_formatted_row(subset_h, exp, 'AMMO_ODE')
+            row.extend([alpha, rho, rmse])
+        latex.append("    " + " & ".join(row) + f" {br}")
+        
+    latex.append(r"    \bottomrule")
+    latex.append(r"    \end{tabular}")
+    
+    latex.append(r"\end{table}")
     latex.append(r"\end{landscape}")
 
     print('\n'.join(latex))
 
+
+def print_extreme_h_latex_table(csv_path="results/stage1_parameters.csv"):
+    if not os.path.exists(csv_path):
+        print(f"Error: {csv_path} not found.")
+        return
+
+    df = pd.read_csv(csv_path)
+    df['H'] = df['H'].round(3)
+    df['Expiry'] = df['Expiry'].round(3)
+
+    # 1. Isolate the extreme boundaries
+    target_Hs = [0.05, 0.50]
+    df = df[df['H'].isin(target_Hs)]
+    all_expiries = sorted(df['Expiry'].unique())
+
+    # Helper function for data extraction and strict formatting
+    def extract_formatted_row(subset_h, exp, method):
+        row = subset_h[(subset_h['Expiry'] == exp) & (subset_h['Method'] == method)]
+        if row.empty:
+            return '-', '-', '-'
+        
+        alpha_val = row['Alpha'].values[0] * 10000.0
+        rho_val = row['Rho'].values[0]
+        rmse_val = row['RMSE_bps'].values[0]
+        
+        alpha_str = f"{alpha_val:.1f}"
+        
+        # 2. Format Rho to drop leading zero (e.g., -.148 instead of -0.148)
+        rho_str = f"{rho_val:.2f}".replace('0.', '.', 1).replace('-0.', '-.', 1)
+        if rho_str in ['.000', '-.000']: 
+            rho_str = '.000'
+            
+        # 3. No bolding for RMSE
+        rmse_str = f"{rmse_val:.2f}"
+        
+        return alpha_str, rho_str, rmse_str
+
+    br = r"\\"
+    latex = []
+    
+    latex.append(r"\begin{table}[ht]")
+    latex.append(r"    \centering")
+    latex.append(r"    \scriptsize")
+    latex.append(r"    \setlength{\tabcolsep}{3pt}")
+    latex.append(r"    \caption{Stage 1 Calibrated Parameters: High-Fidelity MC vs Low-Fidelity ODE surrogate at the extreme rough boundary ($H=0.05$) and the classical boundary ($H=0.50$).}")
+    latex.append(r"    \vspace{0.5em}")
+    
+    # Define a clean 13-column layout with vertical pipes separating the major blocks
+    latex.append(r"    \begin{tabular}{l | ccc | ccc | ccc | ccc}")
+    latex.append(r"    \toprule")
+    
+    # Header Row 1: Hurst Exponents
+    latex.append(rf"    \multirow{{3}}{{*}}{{\textbf{{Exp}}}} & \multicolumn{{6}}{{c|}}{{\textbf{{H=0.05}}}} & \multicolumn{{6}}{{c}}{{\textbf{{H=0.50}}}} {br}")
+    
+    # Header Row 2: Method and Nu
+    nu_row = [""]
+    for i, h in enumerate(target_Hs):
+        subset_h = df[df['H'] == h]
+        mc_nu = subset_h[subset_h['Method'] == 'PURE_MC']['Nu']
+        ode_nu = subset_h[subset_h['Method'] == 'AMMO_ODE']['Nu']
+        mc_v = mc_nu.iloc[0] if not mc_nu.empty else 0.0
+        ode_v = ode_nu.iloc[0] if not ode_nu.empty else 0.0
+        
+        # Manage the vertical pipes formatting
+        pipe = "|" if i == 0 else "" 
+        
+        nu_row.append(rf"\multicolumn{{3}}{{c|}}{{MC ($\nu={mc_v:.2f}$)}}")
+        nu_row.append(rf"\multicolumn{{3}}{{c{pipe}}}{{ODE ($\nu={ode_v:.2f}$)}}")
+        
+    latex.append("    & " + " & ".join(nu_row[1:]) + f" {br}")
+    
+    # Header Row 3: Cmidrules
+    latex.append(r"    \cmidrule(lr){2-4} \cmidrule(lr){5-7} \cmidrule(lr){8-10} \cmidrule(lr){11-13}")
+    
+    # Header Row 4: Metrics (Alpha, Rho, Err)
+    metric_row = [""] + [r"$\alpha$", r"$\rho$", r"\textbf{Err}"] * 4
+    latex.append("    " + " & ".join(metric_row) + f" {br}")
+    latex.append(r"    \midrule")
+    
+    # Body Data
+    for exp in all_expiries:
+        row_data = [f"{exp:.1f}"]
+        for h in target_Hs:
+            subset_h = df[df['H'] == h]
+            
+            # Extract MC data
+            mc_a, mc_r, mc_e = extract_formatted_row(subset_h, exp, 'PURE_MC')
+            # Extract ODE data
+            ode_a, ode_r, ode_e = extract_formatted_row(subset_h, exp, 'AMMO_ODE')
+            
+            row_data.extend([mc_a, mc_r, mc_e, ode_a, ode_r, ode_e])
+            
+        latex.append("    " + " & ".join(row_data) + f" {br}")
+        
+    latex.append(r"    \bottomrule")
+    latex.append(r"    \end{tabular}")
+    latex.append(r"\end{table}")
+
+    print('\n'.join(latex))
 
 
 # 3. PARAMETERS CHARTS
@@ -300,7 +468,7 @@ def plot_parameter_grid(csv_path="results/stage1_parameters.csv", save_path="res
     
     # Add a single unified legend outside the plots
     handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='center right', bbox_to_anchor=(1.1, 0.5), title="Hurst Exponent", title_fontsize='11', fontsize='10')
+    fig.legend(handles, labels, loc='center right', bbox_to_anchor=(0.9, 0.5), title="Hurst Exponent", title_fontsize='11', fontsize='10')
     
     # Adjust layout to make room for the legend and title
     plt.tight_layout(rect=[0, 0, 0.98, 0.96])
@@ -312,7 +480,77 @@ def plot_parameter_grid(csv_path="results/stage1_parameters.csv", save_path="res
     print(f"Saved high-resolution grid to {save_path}")
 
 
-def plot_true_3d_surfaces(method='AMMO_ODE', results_dir='results', h_target=None, param_csv=None):
+def plot_publication_parameter_grid(csv_path="results/stage1_parameters.csv"):
+    if not os.path.exists(csv_path):
+        print(f"Error: {csv_path} not found. Wait for the calibration to finish!")
+        return
+
+    # Academic LaTeX Configuration
+    plt.rcParams.update({
+        "text.usetex": False,
+        "font.family": "serif",
+        "font.serif": ["STIXGeneral", "Computer Modern Roman"],
+        "mathtext.fontset": "cm",
+        "axes.labelsize": 10,
+        "font.size": 10,
+        "legend.fontsize": 8,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "axes.titlesize": 11,
+        "figure.figsize": (6.5, 4.5), 
+        "figure.constrained_layout.use": True 
+    })
+        
+    df = pd.read_csv(csv_path)
+    
+    fig, axes = plt.subplots(2, 2, sharex=True, sharey='row')
+    
+    h_values = sorted(df['H'].unique())
+    colors = cm.viridis(np.linspace(0.1, 0.9, len(h_values)))
+    
+    def plot_panel(ax, method, param, ylabel, title, multiplier=1.0):
+        df_method = df[df['Method'] == method]
+        
+        for idx, h in enumerate(h_values):
+            subset = df_method[df_method['H'] == h].sort_values('Expiry')
+            if not subset.empty:
+                x_data = subset['Expiry'].to_numpy()
+                y_data = (subset[param] * multiplier).to_numpy()
+                
+                # 1 & 2 FIX: Reduced line width to 0.8 for thinner curves
+                ax.plot(x_data, y_data, 
+                        marker='o', markersize=3, lw=0.8, 
+                        color=colors[idx], label=rf"$H = {h:.2f}$")
+                
+        ax.set_title(title)
+        if ylabel:
+            ax.set_ylabel(ylabel)
+            
+        # 3 FIX: Removed ax.grid() and the ax.axhline() zero-axis line entirely
+            
+    # Populate the 4 panels
+    plot_panel(axes[0, 0], 'PURE_MC', 'Alpha', r"Base Volatility $\alpha$ (bps)", r"Exact MC ($\alpha$)", multiplier=10000.0)
+    plot_panel(axes[0, 1], 'AMMO_ODE', 'Alpha', "", r"ODE Surrogate ($\alpha$)", multiplier=10000.0)
+
+    plot_panel(axes[1, 0], 'PURE_MC', 'Rho', r"Correlation $\rho$", r"Exact MC ($\rho$)")
+    plot_panel(axes[1, 1], 'AMMO_ODE', 'Rho', "", r"ODE Surrogate ($\rho$)")
+    
+    axes[1, 0].set_xlabel(r"Expiry $T$ (Years)")
+    axes[1, 1].set_xlabel(r"Expiry $T$ (Years)")
+    
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    # Increased the x-anchor to 1.16 to add breathing room, and removed the border with frameon=False
+    fig.legend(handles, labels, loc='center left', bbox_to_anchor=(1.02, 0.5), title="Hurst", frameon=False)
+    
+    save_path = "results/publication_parameter_grid.pdf"
+    plt.savefig(save_path, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Saved publication-ready grid to {save_path}")
+    
+
+# 4. SURFACES
+def plot_true_3d_surfaces(method='PURE_MC', results_dir='results', h_target=None, param_csv=None):
     """
     Plot market vs model 3D surfaces and residual bars.
 
@@ -455,10 +693,135 @@ def plot_true_3d_surfaces(method='AMMO_ODE', results_dir='results', h_target=Non
 
     print(f"Awesome! Saved fully 3D plot to {save_path}")
 
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib import cm
+from matplotlib.gridspec import GridSpec
 
+def plot_publication_vol_grid(method='PURE_MC', results_dir='results', h_target=None):
+    market_file = os.path.join(results_dir, 'stage1_surface_MARKET.csv')
+    model_file = os.path.join(results_dir, f'stage1_surface_{method.upper()}.csv')
+    
+    df_market = pd.read_csv(market_file, index_col=0)
+    df_model_raw = pd.read_csv(model_file)
+    
+    if 'H' in df_model_raw.columns:
+        selected_h = h_target if h_target else df_model_raw['H'].iloc[0]
+        h_match = df_model_raw[np.isclose(df_model_raw['H'], selected_h, atol=1e-8)]
+        strike_cols = [c for c in h_match.columns if c not in ['Expiry', 'H']]
+        df_model = h_match.set_index('Expiry')[strike_cols]
+    else:
+        df_model = pd.read_csv(model_file, index_col=0)
 
-# 5. SURFACES OVERLEAF
+    df_market.index = df_market.index.astype(float)
+    df_market.columns = df_market.columns.astype(float)
+    df_model.index = df_model.index.astype(float)
+    df_model.columns = df_model.columns.astype(float)
 
+    common_exp = sorted(set(df_market.index).intersection(set(df_model.index)))
+    common_str = sorted(set(df_market.columns).intersection(set(df_model.columns)))
+    
+    df_mkt = df_market.loc[common_exp, common_str] * 10000.0
+    df_mod = df_model.loc[common_exp, common_str] * 10000.0
+    df_res = df_mod - df_mkt
+    
+    strikes_bps = np.array(common_str) * 10000.0
+    expiries_yrs = np.array(common_exp)
+    X, Y = np.meshgrid(strikes_bps, expiries_yrs)
+    
+    v_min = min(df_mkt.values.min(), df_mod.values.min())
+    v_max = max(df_mkt.values.max(), df_mod.values.max())
+    
+    fig = plt.figure()
+    gs = GridSpec(2, 2, figure=fig, height_ratios=[1, 1]) 
+    view_params = {'elev': 25, 'azim': -125}
+
+    # 1. & 2. FIX: Style the native gridlines to be extremely thin and semi-transparent
+    # 1. & 2. FIX: Style the native gridlines to appear ONLY at the edges
+    def style_3d_axis(ax):
+        # Keep pane backgrounds transparent
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+        
+        # Turn OFF all internal gridlines crossing the middle of the chart
+        ax.grid(False)
+        ax.xaxis._axinfo["grid"].update({"linewidth": 0})
+        ax.yaxis._axinfo["grid"].update({"linewidth": 0})
+        ax.zaxis._axinfo["grid"].update({"linewidth": 0})
+        
+        # Style ONLY the outer edges of the panes (very thin, semi-transparent grey)
+        edge_color = (0.5, 0.5, 0.5, 0.3)
+        ax.xaxis.pane.set_edgecolor("black")
+        ax.yaxis.pane.set_edgecolor("black")
+        ax.zaxis.pane.set_edgecolor("white")
+        
+        ax.xaxis.pane.set_linewidth(0.5)
+        ax.yaxis.pane.set_linewidth(0.5)
+        ax.zaxis.pane.set_linewidth(0.5)
+        
+    mod_title = rf"{method} Surface ($\sigma_{{\mathrm{{Mod}}}}$)"
+    mkt_title = r"Market Surface ($\sigma_{{\mathrm{{Mkt}}}}$)"
+
+    # --- TOP LEFT: MARKET SURFACE ---
+    ax1 = fig.add_subplot(gs[0, 0], projection='3d')
+    ax1.plot_surface(X, Y, df_mkt.values, cmap='viridis', vmin=v_min, vmax=v_max, alpha=0.9, edgecolor='none')
+    ax1.set_title(mkt_title)
+    ax1.set_xlim(strikes_bps.min(), strikes_bps.max())
+    ax1.set_ylim(expiries_yrs.min(), expiries_yrs.max())
+    ax1.set_zlim(v_min, v_max)
+    ax1.view_init(**view_params)
+    style_3d_axis(ax1) 
+
+    # --- TOP RIGHT: MODEL SURFACE ---
+    ax2 = fig.add_subplot(gs[0, 1], projection='3d')
+    ax2.plot_surface(X, Y, df_mod.values, cmap='viridis', vmin=v_min, vmax=v_max, alpha=0.9, edgecolor='none')
+    ax2.set_title(mod_title)
+    ax2.set_xlim(strikes_bps.min(), strikes_bps.max())
+    ax2.set_ylim(expiries_yrs.min(), expiries_yrs.max())
+    ax2.set_zlim(v_min, v_max)
+    ax2.view_init(**view_params)
+    style_3d_axis(ax2)
+
+    # --- BOTTOM: RESIDUAL BAR CHART ---
+    ax3 = fig.add_subplot(gs[1, :], projection='3d')
+    dz_f = df_res.values.flatten()
+    
+    norm = mcolors.TwoSlopeNorm(vmin=-15, vcenter=0, vmax=15)
+    colors = cm.RdBu_r(norm(dz_f))
+    
+    dx = (strikes_bps[-1] - strikes_bps[0]) / (len(strikes_bps) * 2)
+    dy = (expiries_yrs[-1] - expiries_yrs[0]) / (len(expiries_yrs) * 2)
+    
+    # Draw the pricing bars with thin black borders
+    ax3.bar3d(X.flatten(), Y.flatten(), np.zeros_like(dz_f), dx, dy, dz_f, 
+              color=colors, alpha=0.7, edgecolor='black', linewidth=0.3)
+    
+    # Draw the semi-transparent dark grey flat surface exactly at Z=0
+    ax3.plot_surface(X, Y, np.zeros_like(X), color='black', alpha=0.2, edgecolor='none', zorder=1)
+
+    ax3.set_title(r"Pricing Residuals $\Delta\sigma$ (bps)")
+    
+    # Set the limits safely using dx and dy
+    ax3.set_xlim(strikes_bps.min(), strikes_bps.max() + dx)
+    ax3.set_ylim(expiries_yrs.min(), expiries_yrs.max() + dy)
+    ax3.set_zlim(-15, 15)
+    ax3.view_init(**view_params)
+    style_3d_axis(ax3)
+
+    # Set common labels
+    for ax in [ax1, ax2, ax3]:
+        ax.set_xlabel(r"Strike Offset (bps)")
+        ax.set_ylabel(r"Expiry $T$")
+
+    save_name = os.path.join(results_dir, f"pub_comparison_{method}.pdf")
+    plt.savefig(save_name, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Saved styled 3D surface plot to {save_name}")
 
 
 # ========================================================================
@@ -692,13 +1055,17 @@ def print_stage2_latex_performance(perf_csv="results/stage2_performance.csv"):
 if __name__ == '__main__':
     # STAGE 1
     # generate_stage1_results()
-    print_full_latex_longtable()
+    # print_full_latex_longtable()
+    # print_extreme_h_latex_table()
     # plot_parameter_grid()
+    # plot_publication_parameter_grid()
+    plot_publication_vol_grid("AMMO_ODE")
     # plot_true_3d_surfaces(method='AMMO_ODE')
-
+    
     # STAGE 2
     test_H = 0.05    
     # generate_stage2_results()
     # plot_stage2_correlation(h_target=test_H)
     # print_stage2_latex_performance()
+    # plot_publication_vol_grid()
     
