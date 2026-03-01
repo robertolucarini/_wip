@@ -428,11 +428,10 @@ class CorrelationCalibrator:
             current_p = np.full(len(free_indices), np.pi / 4.0)
             strikes = np.zeros_like(exp_targets)
             
-            best_mc_rmse = np.inf
-            best_p = current_p.copy()
+            # best_mc_rmse = np.inf
+            # best_p = current_p.copy()
             
             for ammo_iter in range(2):
-                
                 self.omega[idx, free_indices] = current_p
                 omega_tensor = torch.tensor(self.omega, device=self.device, dtype=self.model.dtype)
                 Sigma_matrix = build_rapisarda_correlation_matrix(omega_tensor)
@@ -441,12 +440,21 @@ class CorrelationCalibrator:
                 v_ode = mapped_smm_ode(self.model, Sigma_matrix, exp_targets, ten_targets, strikes)
                 v_ode_np = v_ode.detach().cpu().numpy()
                 
-                mc_rmse = np.sqrt(np.mean(((v_mc - vol_targets)*10000.0)**2))
-                if mc_rmse < best_mc_rmse:
-                    best_mc_rmse = mc_rmse
-                    best_p = current_p.copy()
+                delta_k = v_mc - v_ode_np  
+                
+                # JUST SAVE IT FOR THE PRINT STATEMENT
+                row_rmse = np.sqrt(np.mean(((v_mc - vol_targets)*10000.0)**2))
+                
+                # v_mc = mapped_smm_pricer(self.model, Sigma_matrix, exp_targets, ten_targets, strikes, dt=1.0/24.0, n_paths=4096)
+                # v_ode = mapped_smm_ode(self.model, Sigma_matrix, exp_targets, ten_targets, strikes)
+                # v_ode_np = v_ode.detach().cpu().numpy()
+                
+                # mc_rmse = np.sqrt(np.mean(((v_mc - vol_targets)*10000.0)**2))
+                # if mc_rmse < best_mc_rmse:
+                #     best_mc_rmse = mc_rmse
+                #     best_p = current_p.copy()
                     
-                delta_k = v_mc - v_ode_np
+                # delta_k = v_mc - v_ode_np
                 
                 def ammo_surrogate(p_inner):
                     self.omega[idx, free_indices] = p_inner
@@ -454,26 +462,38 @@ class CorrelationCalibrator:
                     S_mat = build_rapisarda_correlation_matrix(o_t)
                     v_surr = mapped_smm_ode(self.model, S_mat, exp_targets, ten_targets, strikes)
                     
-                    # 1. Standard Pricing Residuals
                     residuals = (v_surr.detach().cpu().numpy() + delta_k - vol_targets) * 10000.0
                     
-                    # 2. Lesniewski Tikhonov Regularization
-                    import config
-                    if getattr(config, 'USE_TIKHONOV', False):
-                        lam = getattr(config, 'LAMBDA_CURVATURE', 10.0)
+                    if USE_TIKHONOV:
+                        lam = LAMBDA_CURVATURE
+                        S_mat_np = S_mat.detach().cpu().numpy()
+                        row_corr = S_mat_np[idx, 1:idx] 
                         
-                        # Apply discrete differential geometry based on available degrees of freedom
-                        if len(p_inner) >= 3:
-                            # 2nd-Order: Mean Curvature (Flatten the spikes)
-                            pen = p_inner[2:] - 2.0 * p_inner[1:-1] + p_inner[:-2]
-                        elif len(p_inner) == 2:
-                            # 1st-Order: Slope (Prevent sharp jumps)
-                            pen = p_inner[1:] - p_inner[:-1]
+                        # A. Horizontal Curvature (Shape of current row)
+                        if len(row_corr) >= 3:
+                            pen_h = row_corr[2:] - 2.0 * row_corr[1:-1] + row_corr[:-2]
+                        elif len(row_corr) == 2:
+                            pen_h = row_corr[1:] - row_corr[:-1]
                         else:
-                            # 0th-Order: Anchor (Keep single angles stable)
-                            pen = p_inner - (np.pi / 4.0)
+                            pen_h = np.zeros(0)
                             
-                        # Scale to match least_squares MSE definition: sum(f^2)/2
+                        # B. Vertical Anchor (Closes the parallel shift loophole!)
+                        if idx > 2:
+                            prev_corr = S_mat_np[idx-1, 1:idx-1]
+                            pen_v = row_corr[:-1] - prev_corr
+                        else:
+                            pen_v = np.zeros(0)
+                            
+                        # Combine 2D penalties
+                        if len(pen_h) > 0 and len(pen_v) > 0:
+                            pen = np.concatenate([pen_h, pen_v])
+                        elif len(pen_h) > 0:
+                            pen = pen_h
+                        elif len(pen_v) > 0:
+                            pen = pen_v
+                        else:
+                            pen = np.zeros(1)
+                            
                         pen_res = np.sqrt(2.0 * lam) * pen
                         residuals = np.concatenate([residuals, pen_res])
                         
@@ -486,37 +506,47 @@ class CorrelationCalibrator:
                         
                         S_mat = build_rapisarda_correlation_matrix(o_mod)
                         v_surr = mapped_smm_ode(self.model, S_mat, exp_targets, ten_targets, strikes)
-                        
-                        # 1. Differentiable Pricing Residuals
                         res = (v_surr + torch.tensor(delta_k, device=self.device) - torch.tensor(vol_targets, device=self.device)) * 10000.0
                         
-                        # 2. Differentiable Curvature Penalty
-                        import config
-                        if getattr(config, 'USE_TIKHONOV', False):
-                            lam = getattr(config, 'LAMBDA_CURVATURE', 10.0)
-                            if len(p_tensor) >= 3:
-                                pen = p_tensor[2:] - 2.0 * p_tensor[1:-1] + p_tensor[:-2]
-                            elif len(p_tensor) == 2:
-                                pen = p_tensor[1:] - p_tensor[:-1]
+                        if USE_TIKHONOV:
+                            lam = LAMBDA_CURVATURE
+                            row_corr = S_mat[idx, 1:idx]
+                            
+                            if len(row_corr) >= 3:
+                                pen_h = row_corr[2:] - 2.0 * row_corr[1:-1] + row_corr[:-2]
+                            elif len(row_corr) == 2:
+                                pen_h = row_corr[1:] - row_corr[:-1]
                             else:
-                                pen = p_tensor - (np.pi / 4.0)
+                                pen_h = torch.zeros(0, device=self.device, dtype=self.model.dtype)
+                                
+                            if idx > 2:
+                                prev_corr = S_mat[idx-1, 1:idx-1]
+                                pen_v = row_corr[:-1] - prev_corr
+                            else:
+                                pen_v = torch.zeros(0, device=self.device, dtype=self.model.dtype)
+                                
+                            if len(pen_h) > 0 and len(pen_v) > 0:
+                                pen = torch.cat([pen_h, pen_v])
+                            elif len(pen_h) > 0:
+                                pen = pen_h
+                            elif len(pen_v) > 0:
+                                pen = pen_v
+                            else:
+                                pen = torch.zeros(1, device=self.device, dtype=self.model.dtype)
                                 
                             pen_res = math.sqrt(2.0 * lam) * pen
                             res = torch.cat([res, pen_res])
                             
                         return res
                         
-                    # Exact Autograd Jacobian
                     p_t = torch.tensor(p_inner, device=self.device, dtype=self.model.dtype, requires_grad=True)
                     jac = torch.autograd.functional.jacobian(_diff_obj, p_t)
                     
-                    # Prevent Scipy crashes from numerical boundaries
                     jac_np = jac.detach().cpu().numpy()
                     if not np.isfinite(jac_np).all():
                         jac_np = np.nan_to_num(jac_np, nan=0.0, posinf=0.0, neginf=0.0)
-                        
                     return jac_np
-
+                                       
                 res = least_squares(
                     ammo_surrogate, current_p, bounds=bounds, 
                     jac=ammo_jacobian, method='trf', 
@@ -524,10 +554,11 @@ class CorrelationCalibrator:
                 )
                 current_p = res.x
                 
-            self.omega[idx, free_indices] = best_p
+            # self.omega[idx, free_indices] = best_p
+            self.omega[idx, free_indices] = current_p
             
             row_time = time.time() - row_start_time
-            print(f"Done! RMSE: {best_mc_rmse:5.2f} bps | Time: {row_time:4.2f}s")
+            print(f"Done! RMSE: {row_rmse:5.2f} bps | Time: {row_time:4.2f}s")
         
         omega_tensor = torch.tensor(self.omega, device=self.device, dtype=self.model.dtype)
         Sigma_final = build_rapisarda_correlation_matrix(omega_tensor)
