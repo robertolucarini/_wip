@@ -3,6 +3,7 @@ import time
 import numpy as np
 from src.torch_model import TorchRoughSABR_FMM
 from src.utils import bootstrap_forward_rates, load_discount_curve
+from config import USE_TIKHONOV, LAMBDA_CURVATURE
 
 
 def run_aad_vs_fd_test():

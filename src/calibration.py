@@ -10,6 +10,7 @@ from src.pricers import mapped_smm_pricer
 import time
 import pandas as pd
 from src.utils import build_rapisarda_correlation_matrix, log_progress
+from config import USE_TIKHONOV, LAMBDA_CURVATURE
 
 
 def mc_rough_bergomi_pricer(K_flat, T_flat, alpha_flat, rho_flat, nu_in, H, n_paths=(32768/2), dt=1.0/50.0, kappa_hybrid=1, device='cpu'):

@@ -38,7 +38,7 @@ from src.utils import load_discount_curve, bootstrap_forward_rates
 from src.torch_model import TorchRoughSABR_FMM
 from src.calibration import CorrelationCalibrator
 from main import load_atm_matrix
-from config import BETA_SABR, SHIFT_SABR, SMOOTHED
+from config import BETA_SABR, SHIFT_SABR
 from scipy.optimize import curve_fit
 from matplotlib.gridspec import GridSpec
 
