@@ -61,19 +61,6 @@ def generate_stage1_results(methods=['AMMO_ODE', 'PURE_MC']):
     print("Loading market data...")
     # 1. Load the original matrices
     vol_matrix_1y = load_swaption_vol_surface("data/estr_vol_full_strikes.csv", 1.0)
-    atm_matrix = load_atm_matrix("data/estr_vol_full_strikes.csv")
-
-    if SMOOTHED:
-        print("Applying Brigo-Mercurio ABCD smoothing to ATM Matrix...")
-        atm_matrix = brigo_mercurio_abcd_smooth(atm_matrix)
-        
-        # 2. THE FIX: Anchor the Stage 1 smile to the smoothed ATM 1Y volatility
-        print("Aligning Stage 1 smiles to smoothed ATM levels...")
-        for exp in vol_matrix_1y.index:
-            old_atm = vol_matrix_1y.loc[exp, 0.0]      # Old ATM (Strike 0 bps)
-            new_atm = atm_matrix.loc[exp, 1.0]         # New smoothed ATM for 1Y Tenor
-            shift = new_atm - old_atm                  # Calculate the noise delta
-            vol_matrix_1y.loc[exp] += shift            # Parallel shift the whole smile
             
     calibrator = RoughSABRCalibrator(vol_matrix_1y)
 
@@ -883,10 +870,6 @@ def setup_stage2_calibrator_for_H(h_target, param_csv="results/stage1_parameters
         beta_sabr=BETA_SABR, shift=SHIFT_SABR, correlation_mode='full', device=device)
     
     atm_matrix = load_atm_matrix("data/estr_vol_full_strikes.csv")
-
-    if SMOOTHED:
-        print("Applying Brigo-Mercurio ABCD smoothing to ATM Matrix...")
-        atm_matrix = brigo_mercurio_abcd_smooth(atm_matrix)
                     
     corr_calibrator = CorrelationCalibrator(atm_matrix, model_base)
 

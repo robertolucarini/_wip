@@ -13,7 +13,7 @@ from src.pricers import torch_bermudan_pricer, torch_bachelier
 from config import CHECK_MC, CHECK_DRIFT
 import pandas as pd
 from src.calibration import CorrelationCalibrator
-from config import CALI_MODE, CORR_MODE, BETA_SABR, SHIFT_SABR, CHECK_LIMIT, H_GRID, SMOOTHED
+from config import CALI_MODE, CORR_MODE, BETA_SABR, SHIFT_SABR, CHECK_LIMIT, H_GRID
 
 
 def load_atm_matrix(csv_path):
