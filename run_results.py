@@ -1054,7 +1054,7 @@ def print_stage2_latex_performance(perf_csv="results/stage2_performance.csv"):
 # ========================================================================
 if __name__ == '__main__':
     # STAGE 1
-    # generate_stage1_results()
+    generate_stage1_results()
     # print_full_latex_longtable()
     # print_extreme_h_latex_table()
     # plot_parameter_grid()
@@ -1065,7 +1065,7 @@ if __name__ == '__main__':
     # STAGE 2
     test_H = 0.05    
     # generate_stage2_results()
-    plot_stage2_correlation(h_target=test_H)
+    # plot_stage2_correlation(h_target=test_H)
     # print_stage2_latex_performance()
     # plot_publication_vol_grid()
     
