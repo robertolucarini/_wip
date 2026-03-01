@@ -6,14 +6,14 @@ import time
 torch.set_num_threads(os.cpu_count()) 
 torch.backends.cudnn.benchmark = True
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.utils.checkpoint")
-from src.utils import print_summary_table, print_greek_ladder, load_discount_curve, bootstrap_forward_rates, load_swaption_vol_surface
+from src.utils import print_summary_table, print_greek_ladder, load_discount_curve, bootstrap_forward_rates, load_swaption_vol_surface, brigo_mercurio_abcd_smooth
 from src.calibration import RoughSABRCalibrator
 from src.torch_model import TorchRoughSABR_FMM
 from src.pricers import torch_bermudan_pricer, torch_bachelier
 from config import CHECK_MC, CHECK_DRIFT
 import pandas as pd
 from src.calibration import CorrelationCalibrator
-from config import CALI_MODE, CORR_MODE, BETA_SABR, SHIFT_SABR, CHECK_LIMIT, H_GRID
+from config import CALI_MODE, CORR_MODE, BETA_SABR, SHIFT_SABR, CHECK_LIMIT, H_GRID, SMOOTHED
 
 
 def load_atm_matrix(csv_path):
@@ -45,12 +45,46 @@ if __name__ == "__main__":
     t_init = time.time()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # --- 1. STAGE 1: 1D MARGINAL CALIBRATION ---
+    # --- 1. DATA PREPARATION & SMOOTHING ---
     ois_func = load_discount_curve("data/estr_disc.csv")
     grid_T, F0_rates = bootstrap_forward_rates(ois_func)
-    vol_matrix_1y = load_swaption_vol_surface("data/estr_vol_full_strikes.csv", 1.0)
     
-    # Run the fast ODE grid search to find the global Hurst (H) and Nu
+    # Load raw matrices
+    vol_matrix_1y = load_swaption_vol_surface("data/estr_vol_full_strikes.csv", 1.0)
+    atm_matrix_raw = load_atm_matrix("data/estr_vol_full_strikes.csv")
+
+    # THE FIX: Brigo-Mercurio Smoothing and Stage 1 Anchor Alignment
+    if SMOOTHED:
+        print("\nApplying Brigo-Mercurio ABCD smoothing to ATM Matrix...")
+        atm_matrix = brigo_mercurio_abcd_smooth(atm_matrix_raw)
+        
+        print("Aligning Stage 1 smiles to smoothed ATM levels to prevent arbitrage...")
+        
+        # Bulletproof check: Find exactly how the ATM strike is labeled in your matrix
+        if 0.0 in vol_matrix_1y.columns:
+            atm_strike_label = 0.0
+        elif 'ATM' in vol_matrix_1y.columns:
+            atm_strike_label = 'ATM'
+        elif 0 in vol_matrix_1y.columns:
+            atm_strike_label = 0
+        else:
+            raise KeyError(f"Could not find ATM column in Stage 1 smile. Available columns: {vol_matrix_1y.columns}")
+            
+        for exp in vol_matrix_1y.index:
+            # Ensure the expiry exists in the ATM matrix and we have the 1Y Tenor column
+            if exp in atm_matrix.index and 1.0 in atm_matrix.columns:
+                old_atm = vol_matrix_1y.loc[exp, atm_strike_label] # Dynamically grab ATM
+                new_atm = atm_matrix.loc[exp, 1.0]                 # Grab smoothed 1Y-Tenor ATM
+                
+                shift = new_atm - old_atm                          # Calculate noise delta
+                vol_matrix_1y.loc[exp] += shift                    # Parallel shift the whole smile
+    else:
+        atm_matrix = atm_matrix_raw
+
+
+
+    # --- 2. STAGE 1: 1D MARGINAL CALIBRATION ---
+    # Run the fast ODE grid search to find the global Hurst (H) and Nu using the SHIFTED smile
     calibrator = RoughSABRCalibrator(vol_matrix_1y)
     calib = calibrator.calibrate(method=CALI_MODE, H_grid=H_GRID)
 
@@ -60,21 +94,19 @@ if __name__ == "__main__":
         "Status": "SUCCESS"
     })
 
+
     if CORR_MODE == 'full':
-        # --- 2. STAGE 2: SPATIAL CORRELATION CALIBRATION ---
+        # --- 3. STAGE 2: SPATIAL CORRELATION CALIBRATION ---
         # Instantiate a temporary model to pass the 1D dynamics into the calibrator
         model_base = TorchRoughSABR_FMM(grid_T, F0_rates, calib['alpha_func'], 
                                         calib['rho_func'], calib['nu_func'], calib['H'], 
                                         beta_sabr=BETA_SABR, shift=SHIFT_SABR, correlation_mode=CORR_MODE, device=device)
         
-        # Load the full Expiry x Tenor ATM Swaption Matrix
-        atm_matrix = load_atm_matrix("data/estr_vol_full_strikes.csv")
-        
-        # Calibrate the NxN Angles row-by-row
+        # Calibrate the NxN Angles row-by-row using the ALREADY SMOOTHED atm_matrix
         corr_calibrator = CorrelationCalibrator(atm_matrix, model_base)
         corr_res = corr_calibrator.calibrate()
 
-        # --- 3. FINAL PRODUCTION MODEL ---
+        # --- 4. FINAL PRODUCTION MODEL ---
         # Instantiate the final model utilizing the full rank and the calibrated Rapisarda angles!
         model = TorchRoughSABR_FMM(grid_T, F0_rates, calib['alpha_func'], 
                                    calib['rho_func'], calib['nu_func'], calib['H'], 

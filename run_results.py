@@ -34,11 +34,14 @@ from config import H_GRID
 from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.colors as mcolors
 from scipy.interpolate import PchipInterpolator
-from src.utils import load_discount_curve, bootstrap_forward_rates
+from src.utils import load_discount_curve, bootstrap_forward_rates, brigo_mercurio_abcd_smooth
 from src.torch_model import TorchRoughSABR_FMM
 from src.calibration import CorrelationCalibrator
 from main import load_atm_matrix
-from config import BETA_SABR, SHIFT_SABR
+from config import BETA_SABR, SHIFT_SABR, SMOOTHED
+from scipy.optimize import curve_fit
+from matplotlib.gridspec import GridSpec
+
 
 
 # ========================================================================
@@ -56,7 +59,22 @@ def generate_stage1_results(methods=['AMMO_ODE', 'PURE_MC']):
     os.makedirs('results', exist_ok=True)
 
     print("Loading market data...")
+    # 1. Load the original matrices
     vol_matrix_1y = load_swaption_vol_surface("data/estr_vol_full_strikes.csv", 1.0)
+    atm_matrix = load_atm_matrix("data/estr_vol_full_strikes.csv")
+
+    if SMOOTHED:
+        print("Applying Brigo-Mercurio ABCD smoothing to ATM Matrix...")
+        atm_matrix = brigo_mercurio_abcd_smooth(atm_matrix)
+        
+        # 2. THE FIX: Anchor the Stage 1 smile to the smoothed ATM 1Y volatility
+        print("Aligning Stage 1 smiles to smoothed ATM levels...")
+        for exp in vol_matrix_1y.index:
+            old_atm = vol_matrix_1y.loc[exp, 0.0]      # Old ATM (Strike 0 bps)
+            new_atm = atm_matrix.loc[exp, 1.0]         # New smoothed ATM for 1Y Tenor
+            shift = new_atm - old_atm                  # Calculate the noise delta
+            vol_matrix_1y.loc[exp] += shift            # Parallel shift the whole smile
+            
     calibrator = RoughSABRCalibrator(vol_matrix_1y)
 
     expiries = calibrator.expiries
@@ -693,13 +711,6 @@ def plot_true_3d_surfaces(method='PURE_MC', results_dir='results', h_target=None
 
     print(f"Awesome! Saved fully 3D plot to {save_path}")
 
-import os
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-from matplotlib import cm
-from matplotlib.gridspec import GridSpec
 
 def plot_publication_vol_grid(method='PURE_MC', results_dir='results', h_target=None):
     market_file = os.path.join(results_dir, 'stage1_surface_MARKET.csv')
@@ -824,6 +835,7 @@ def plot_publication_vol_grid(method='PURE_MC', results_dir='results', h_target=
     print(f"Saved styled 3D surface plot to {save_name}")
 
 
+
 # ========================================================================
 # Calibration Stage 2
 # ========================================================================
@@ -868,12 +880,16 @@ def setup_stage2_calibrator_for_H(h_target, param_csv="results/stage1_parameters
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model_base = TorchRoughSABR_FMM(
         grid_T, F0_rates, alpha_func, rho_func, nu_func, h_target, 
-        beta_sabr=BETA_SABR, shift=SHIFT_SABR, correlation_mode='full', device=device
-    )
+        beta_sabr=BETA_SABR, shift=SHIFT_SABR, correlation_mode='full', device=device)
     
     atm_matrix = load_atm_matrix("data/estr_vol_full_strikes.csv")
+
+    if SMOOTHED:
+        print("Applying Brigo-Mercurio ABCD smoothing to ATM Matrix...")
+        atm_matrix = brigo_mercurio_abcd_smooth(atm_matrix)
+                    
     corr_calibrator = CorrelationCalibrator(atm_matrix, model_base)
-    
+
     return corr_calibrator
 
 
@@ -1054,16 +1070,16 @@ def print_stage2_latex_performance(perf_csv="results/stage2_performance.csv"):
 # ========================================================================
 if __name__ == '__main__':
     # STAGE 1
-    # generate_stage1_results()
+    generate_stage1_results()
     # print_full_latex_longtable()
     # print_extreme_h_latex_table()
     # plot_parameter_grid()
     # plot_publication_parameter_grid()
-    plot_publication_vol_grid("AMMO_ODE")
+    # plot_publication_vol_grid("AMMO_ODE")
     # plot_true_3d_surfaces(method='AMMO_ODE')
     
     # STAGE 2
-    test_H = 0.05    
+    # test_H = 0.05    
     # generate_stage2_results()
     # plot_stage2_correlation(h_target=test_H)
     # print_stage2_latex_performance()

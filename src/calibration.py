@@ -173,6 +173,28 @@ class RoughSABRCalibrator:
         return alpha * ratio * (1.0 + drift)
 
 
+    def rough_sabr_vol_mc(self, k, T, alpha, rho, nu, H):
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        K_t = torch.tensor(k, device=device, dtype=torch.float64)
+        T_t = torch.tensor(T, device=device, dtype=torch.float64)
+        alpha_t = torch.tensor(alpha, device=device, dtype=torch.float64)
+        rho_t = torch.tensor(rho, device=device, dtype=torch.float64)
+        nu_t = torch.tensor(nu, device=device, dtype=torch.float64)
+        
+        mc_prices_t = mc_rough_bergomi_pricer(
+            K_t, T_t, alpha_t, rho_t, nu_t, H, 
+            n_paths=16384, 
+            dt=1.0/24.0, 
+            kappa_hybrid=1, 
+            device=device
+        )
+        
+        mc_prices = mc_prices_t.cpu().numpy()
+        ivs = bachelier_iv_newton(mc_prices, k, T, initial_guess_vol=alpha)
+        
+        return ivs
+    
+
     def calibrate(self, method='PURE_MC', H_grid=np.array([0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50])):
         import time
         from scipy.interpolate import PchipInterpolator
@@ -353,28 +375,6 @@ class RoughSABRCalibrator:
             'nu_func': nu_func
         }
         
-
-    def rough_sabr_vol_mc(self, k, T, alpha, rho, nu, H):
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        K_t = torch.tensor(k, device=device, dtype=torch.float64)
-        T_t = torch.tensor(T, device=device, dtype=torch.float64)
-        alpha_t = torch.tensor(alpha, device=device, dtype=torch.float64)
-        rho_t = torch.tensor(rho, device=device, dtype=torch.float64)
-        nu_t = torch.tensor(nu, device=device, dtype=torch.float64)
-        
-        mc_prices_t = mc_rough_bergomi_pricer(
-            K_t, T_t, alpha_t, rho_t, nu_t, H, 
-            n_paths=16384, 
-            dt=1.0/24.0, 
-            kappa_hybrid=1, 
-            device=device
-        )
-        
-        mc_prices = mc_prices_t.cpu().numpy()
-        ivs = bachelier_iv_newton(mc_prices, k, T, initial_guess_vol=alpha)
-        
-        return ivs
-    
 
 class CorrelationCalibrator:
     def __init__(self, atm_vol_matrix, model):
