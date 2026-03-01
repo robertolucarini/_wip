@@ -284,6 +284,9 @@ class RoughSABRCalibrator:
             elif method in ['PURE_MC', 'MC']:
                 log_progress("MC-Opt", "Starting True Pure Monte Carlo Global Optimization...", level=1)
                 
+                # Guess is now: [Nu, Alpha_1...Alpha_N, Rho_1...Rho_N]
+                guess_global = np.concatenate(([smart_nu_guess], base_market_alphas, local_rhos))
+                
                 # Bounds for Nu, Alphas (must be >0), and Rhos
                 lower_bounds = np.concatenate(([0.001], np.full(self.n_exp, 0.0001), np.full(self.n_exp, -0.999)))
                 upper_bounds = np.concatenate(([10.0], np.full(self.n_exp, 1.0), np.full(self.n_exp, 0.999)))
