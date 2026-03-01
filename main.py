@@ -6,7 +6,7 @@ import time
 torch.set_num_threads(os.cpu_count()) 
 torch.backends.cudnn.benchmark = True
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.utils.checkpoint")
-from src.utils import print_summary_table, print_greek_ladder, load_discount_curve, bootstrap_forward_rates, load_swaption_vol_surface, brigo_mercurio_abcd_smooth
+from src.utils import print_summary_table, print_greek_ladder, load_discount_curve, bootstrap_forward_rates, load_swaption_vol_surface
 from src.calibration import RoughSABRCalibrator
 from src.torch_model import TorchRoughSABR_FMM
 from src.pricers import torch_bermudan_pricer, torch_bachelier
