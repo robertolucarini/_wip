@@ -34,7 +34,7 @@ from config import H_GRID
 from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.colors as mcolors
 from scipy.interpolate import PchipInterpolator
-from src.utils import load_discount_curve, bootstrap_forward_rates, brigo_mercurio_abcd_smooth
+from src.utils import load_discount_curve, bootstrap_forward_rates
 from src.torch_model import TorchRoughSABR_FMM
 from src.calibration import CorrelationCalibrator
 from main import load_atm_matrix
